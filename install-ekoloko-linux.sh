@@ -297,7 +297,6 @@ LAUNCHER_EOF
 cat >> "$LAUNCHER" <<LAUNCHER_VARS
 HOME_JAIL="$HOME_JAIL"
 BIN_NAME="$BIN_NAME"
-APP_BIN="\$HOME_JAIL/app/\$BIN_NAME"
 LAUNCHER_VARS
 
 cat >> "$LAUNCHER" <<'LAUNCHER_EOF'
@@ -396,7 +395,8 @@ run_bwrap() {
     fi
 
     # Use eval to safely pass the args to bwrap (all args are trusted at this point)
-    eval "exec bwrap $bwrap_args '$APP_BIN' --no-sandbox \"\$@\""
+    # Inside sandbox, HOME is bound to $HOME_JAIL, so use relative path
+    eval "exec bwrap $bwrap_args \"\$HOME/app/\$BIN_NAME\" --no-sandbox \"\$@\""
 }
 
 run_firejail() {
@@ -404,12 +404,12 @@ run_firejail() {
         --private="$HOME_JAIL" --private-tmp \
         --caps.drop=all --nonewprivs --noroot --seccomp \
         --protocol=unix,inet,inet6,netlink --disable-mnt \
-        "$APP_BIN" --no-sandbox "$@"
+        "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
 }
 
 # Main dispatcher
 if [ "${EKOLOKO_NO_JAIL:-0}" = "1" ]; then
-    exec "$APP_BIN" --no-sandbox "$@"
+    exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
 elif command -v bwrap >/dev/null 2>&1; then
     run_bwrap "$@"
 elif command -v firejail >/dev/null 2>&1; then
@@ -421,7 +421,7 @@ else
             echo "Warning: X11 session detected. X11 offers no isolation between clients (keylogging/screenshotting possible)."
         fi
     } >&2
-    exec "$APP_BIN" --no-sandbox "$@"
+    exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
 fi
 LAUNCHER_EOF
 
