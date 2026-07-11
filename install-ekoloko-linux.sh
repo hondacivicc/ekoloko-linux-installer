@@ -379,9 +379,9 @@ run_bwrap() {
         a+=( --ro-bind-try "$RT/$WAYLAND_DISPLAY" "$RT/$WAYLAND_DISPLAY" )
     fi
 
-    # Audio (PipeWire, PulseAudio)
+    # Audio (PipeWire native socket + PulseAudio socket)
     [ -S "$RT/pipewire-0" ] && a+=( --ro-bind-try "$RT/pipewire-0" "$RT/pipewire-0" )
-    [ -S "$RT/pulse" ] && a+=( --ro-bind-try "$RT/pulse" "$RT/pulse" )
+    [ -S "$RT/pulse/native" ] && a+=( --ro-bind-try "$RT/pulse/native" "$RT/pulse/native" )
 
     # X11 socket
     [ -d /tmp/.X11-unix ] && a+=( --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix )
