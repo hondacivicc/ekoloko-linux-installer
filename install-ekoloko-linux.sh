@@ -30,8 +30,8 @@ DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_PATH="${XDG_DATA_HOME:-$HOME/.local/share}/icons/ekoloko.png"
 
 # Optional version pinning. Set both to enforce a specific release version.
-# When pinned, the installer verifies the downloaded AppImage SHA256.
-# Set PINNED_VERSION="" to disable.
+# When pinned, the installer fetches that release tag instead of latest,
+# and verifies the AppImage SHA256. Set PINNED_VERSION="" to disable.
 PINNED_VERSION=""
 PINNED_SHA256=""
 
@@ -154,24 +154,32 @@ ensure_sandbox() {
 }
 ensure_sandbox
 
-# --- fetch latest release
+# --- fetch release
 
-info "Looking up latest release of $REPO"
+info "Looking up release of $REPO"
 
 get_download_url() {
     local api_response
     local url
+    local release_url
 
-    if ! api_response=$(fetch_text "https://api.github.com/repos/$REPO/releases/latest" 2>&1); then
+    # Determine which release to fetch
+    if [ -n "$PINNED_VERSION" ] && [ $SKIP_PIN -eq 0 ]; then
+        release_url="https://api.github.com/repos/$REPO/releases/tags/$PINNED_VERSION"
+    else
+        release_url="https://api.github.com/repos/$REPO/releases/latest"
+    fi
+
+    if ! api_response=$(fetch_text "$release_url" 2>&1); then
         return 1
     fi
 
-    # Detect rate limiting
-    if echo "$api_response" | grep -q '"message".*"rate limit"'; then
+    # Detect rate limiting (GitHub's actual format has no inner quotes)
+    if echo "$api_response" | grep -q '"message".*rate limit'; then
         die "GitHub API rate limited. Wait a few minutes or visit https://github.com/ekolokonet/ekoloko-desktop-app/releases"
     fi
 
-    # Detect API errors
+    # Detect API errors (e.g., pinned version not found)
     if echo "$api_response" | grep -q '"message"' && ! echo "$api_response" | grep -q 'browser_download_url'; then
         die "GitHub API error: $(echo "$api_response" | grep -o '"message":"[^"]*"' | head -1)"
     fi
@@ -303,100 +311,91 @@ cat >> "$LAUNCHER" <<'LAUNCHER_EOF'
 
 RT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
-# Ensure runtime dir and app home exist
-mkdir -p "$HOME_JAIL" "$RT"
+# Ensure app home exists; runtime dir is checked later
+mkdir -p "$HOME_JAIL"
 
 run_bwrap() {
-    # Build bwrap arguments. Bash 3.2-compatible: build array step-by-step.
-    # Start with base system binds
-    local arg1="--die-with-parent"
-    local arg2="--new-session"
-    local arg3="--unshare-all"
-    local arg4="--share-net"
-    local arg5="--clearenv"
-    local arg6="--ro-bind"
-    local arg7="/usr"
-    local arg8="/usr"
-    local arg9="--ro-bind-try"
-    local arg10="/lib64"
-    local arg11="/lib64"
-    local arg12="--symlink"
-    local arg13="usr/lib"
-    local arg14="/lib"
-    local arg15="--symlink"
-    local arg16="usr/bin"
-    local arg17="/bin"
-    local arg18="--symlink"
-    local arg19="usr/bin"
-    local arg20="/sbin"
+    local -a a=(
+        --die-with-parent
+        --new-session
+        --unshare-all --share-net
+        --clearenv
+        --ro-bind /usr /usr
+        --ro-bind-try /lib64 /lib64
+        --symlink usr/lib /lib
+        --symlink usr/bin /bin
+        --symlink usr/bin /sbin
+        --ro-bind-try /etc/ssl /etc/ssl
+        --ro-bind-try /etc/pki /etc/pki
+        --ro-bind-try /etc/ca-certificates /etc/ca-certificates
+        --ro-bind-try /etc/hosts /etc/hosts
+        --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
+        --ro-bind-try /etc/resolv.conf /etc/resolv.conf
+        --ro-bind-try /etc/fonts /etc/fonts
+        --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache
+        --ro-bind-try /etc/passwd /etc/passwd
+        --ro-bind-try /etc/group /etc/group
+        --ro-bind-try /etc/localtime /etc/localtime
+        --ro-bind-try /run/systemd/resolve /run/systemd/resolve
+        --ro-bind-try /run/NetworkManager /run/NetworkManager
+        --ro-bind-try /opt /opt
+        --proc /proc
+        --dev /dev
+        --tmpfs /tmp
+        --tmpfs /dev/shm
+    )
 
-    # Run with the base arguments plus dynamic binds added via separate invocation
-    local bwrap_args="$arg1 $arg2 $arg3 $arg4 $arg5 $arg6 $arg7 $arg8 $arg9 $arg10 $arg11 $arg12 $arg13 $arg14 $arg15 $arg16 $arg17 $arg18 $arg19 $arg20"
+    # GPU access (DRI)
+    [ -d /dev/dri ] && a+=( --dev-bind-try /dev/dri /dev/dri )
+    [ -d /sys/dev/char ] && a+=( --ro-bind-try /sys/dev/char /sys/dev/char )
+    [ -d /sys/devices ] && a+=( --ro-bind-try /sys/devices /sys/devices )
 
-    # Essential /etc binds (narrow from full /etc for better confinement)
-    bwrap_args="$bwrap_args --ro-bind /etc/ssl /etc/ssl"
-    [ -f /etc/ca-certificates ] && bwrap_args="$bwrap_args --ro-bind-try /etc/ca-certificates /etc/ca-certificates"
-    [ -f /etc/hosts ] && bwrap_args="$bwrap_args --ro-bind-try /etc/hosts /etc/hosts"
-    [ -f /etc/nsswitch.conf ] && bwrap_args="$bwrap_args --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf"
-    [ -f /etc/resolv.conf ] && bwrap_args="$bwrap_args --ro-bind-try /etc/resolv.conf /etc/resolv.conf"
-    [ -d /etc/fonts ] && bwrap_args="$bwrap_args --ro-bind-try /etc/fonts /etc/fonts"
-
-    # DNS symlinks (systemd-resolved or NetworkManager)
-    bwrap_args="$bwrap_args --ro-bind-try /run/systemd/resolve /run/systemd/resolve"
-    bwrap_args="$bwrap_args --ro-bind-try /run/NetworkManager /run/NetworkManager"
-
-    # Optional /opt
-    [ -d /opt ] && bwrap_args="$bwrap_args --ro-bind-try /opt /opt"
-
-    # Kernel interfaces
-    bwrap_args="$bwrap_args --proc /proc --dev /dev --tmpfs /tmp --tmpfs /dev/shm"
-
-    # GPU access (DRI, NVIDIA)
-    [ -d /dev/dri ] && bwrap_args="$bwrap_args --dev-bind-try /dev/dri /dev/dri"
-    [ -d /sys/dev/char ] && bwrap_args="$bwrap_args --ro-bind-try /sys/dev/char /sys/dev/char"
-    [ -d /sys/devices ] && bwrap_args="$bwrap_args --ro-bind-try /sys/devices /sys/devices"
-    for nv_dev in /dev/nvidia0 /dev/nvidia1 /dev/nvidia2 /dev/nvidia3 /dev/nvidiactl; do
-        [ -e "$nv_dev" ] && bwrap_args="$bwrap_args --dev-bind-try $nv_dev $nv_dev"
+    # GPU access (NVIDIA): bind all existing /dev/nvidia* nodes
+    for nv_dev in /dev/nvidia*; do
+        [ -e "$nv_dev" ] && a+=( --dev-bind-try "$nv_dev" "$nv_dev" )
     done
-    [ -d /sys/class/nvidia ] && bwrap_args="$bwrap_args --ro-bind-try /sys/class/nvidia /sys/class/nvidia"
 
-    # Runtime directory
-    bwrap_args="$bwrap_args --dir $RT --chmod 0700 $RT"
+    # Runtime directory: use resolved path or fallback to temp
+    local rt_to_use="$RT"
+    if [ ! -d "$RT" ] || [ ! -w "$RT" ]; then
+        rt_to_use=$(mktemp -d)
+        trap 'rm -rf "$rt_to_use"' EXIT
+    fi
+    a+=( --dir "$rt_to_use" --chmod 0700 "$rt_to_use" )
 
-    # Wayland socket: only bind if variable is set AND socket exists (protect against empty expansion)
+    # Wayland socket: only bind if variable is set AND socket exists
     if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$RT/$WAYLAND_DISPLAY" ]; then
-        bwrap_args="$bwrap_args --ro-bind-try $RT/$WAYLAND_DISPLAY $RT/$WAYLAND_DISPLAY"
+        a+=( --ro-bind-try "$RT/$WAYLAND_DISPLAY" "$RT/$WAYLAND_DISPLAY" )
     fi
 
     # Audio (PipeWire, PulseAudio)
-    [ -S "$RT/pipewire-0" ] && bwrap_args="$bwrap_args --ro-bind-try $RT/pipewire-0 $RT/pipewire-0"
-    [ -S "$RT/pulse" ] && bwrap_args="$bwrap_args --ro-bind-try $RT/pulse $RT/pulse"
+    [ -S "$RT/pipewire-0" ] && a+=( --ro-bind-try "$RT/pipewire-0" "$RT/pipewire-0" )
+    [ -S "$RT/pulse" ] && a+=( --ro-bind-try "$RT/pulse" "$RT/pulse" )
 
     # X11 socket
-    [ -d /tmp/.X11-unix ] && bwrap_args="$bwrap_args --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix"
+    [ -d /tmp/.X11-unix ] && a+=( --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix )
 
-    # Home and core environment
-    bwrap_args="$bwrap_args --bind $HOME_JAIL $HOME"
-    bwrap_args="$bwrap_args --setenv HOME $HOME"
-    bwrap_args="$bwrap_args --setenv USER ${USER:-user}"
-    bwrap_args="$bwrap_args --setenv PATH /usr/bin:/bin"
-    bwrap_args="$bwrap_args --setenv XDG_RUNTIME_DIR $RT"
-    bwrap_args="$bwrap_args --setenv LANG ${LANG:-C.UTF-8}"
+    # Home and environment
+    a+=(
+        --bind "$HOME_JAIL" "$HOME"
+        --setenv HOME "$HOME"
+        --setenv USER "${USER:-user}"
+        --setenv PATH /usr/bin:/bin
+        --setenv XDG_RUNTIME_DIR "$rt_to_use"
+        --setenv LANG "${LANG:-C.UTF-8}"
+    )
 
     # Session environment (only if set to avoid blank expansions)
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        bwrap_args="$bwrap_args --setenv WAYLAND_DISPLAY $WAYLAND_DISPLAY"
-    fi
-    if [ -n "${DISPLAY:-}" ]; then
-        bwrap_args="$bwrap_args --setenv DISPLAY $DISPLAY"
-    fi
-    if [ -n "${XDG_SESSION_TYPE:-}" ]; then
-        bwrap_args="$bwrap_args --setenv XDG_SESSION_TYPE $XDG_SESSION_TYPE"
+    [ -n "${WAYLAND_DISPLAY:-}" ] && a+=( --setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY" )
+    [ -n "${DISPLAY:-}" ] && a+=( --setenv DISPLAY "$DISPLAY" )
+    [ -n "${XDG_SESSION_TYPE:-}" ] && a+=( --setenv XDG_SESSION_TYPE "$XDG_SESSION_TYPE" )
+
+    # X11 access warning
+    if [ -n "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        echo "Warning: X11 session; X11 clients can observe keystrokes and screenshots from the app." >&2
     fi
 
-    # Use eval to safely pass the args to bwrap (all args are trusted at this point)
-    # Inside sandbox, HOME is bound to $HOME_JAIL, so use relative path
-    eval "exec bwrap $bwrap_args \"\$HOME/app/\$BIN_NAME\" --no-sandbox \"\$@\""
+    exec bwrap "${a[@]}" "$HOME/app/$BIN_NAME" --no-sandbox "$@"
 }
 
 run_firejail() {
@@ -415,12 +414,7 @@ elif command -v bwrap >/dev/null 2>&1; then
 elif command -v firejail >/dev/null 2>&1; then
     run_firejail "$@"
 else
-    {
-        echo "ekoloko: no sandbox (bwrap/firejail) found; running unconfined."
-        if [ -n "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-            echo "Warning: X11 session detected. X11 offers no isolation between clients (keylogging/screenshotting possible)."
-        fi
-    } >&2
+    echo "ekoloko: no sandbox (bwrap/firejail) found; running unconfined." >&2
     exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
 fi
 LAUNCHER_EOF
