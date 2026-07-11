@@ -88,6 +88,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Warn if --latest bypasses a pin
+if [ $SKIP_PIN -eq 1 ] && [ -n "$PINNED_VERSION" ]; then
+    warn "Version pinning and checksum verification skipped (--latest flag)."
+fi
+
 # --- uninstall
 
 if [ $UNINSTALL -eq 1 ]; then
@@ -135,6 +140,7 @@ ensure_sandbox() {
     if command -v pacman >/dev/null 2>&1; then
         sudo pacman -S --needed --noconfirm bubblewrap || true
     elif command -v apt-get >/dev/null 2>&1; then
+        # shellcheck disable=SC2015
         sudo apt-get update -qq && sudo apt-get install -y bubblewrap || true
     elif command -v dnf >/dev/null 2>&1; then
         sudo dnf install -y bubblewrap || true
@@ -191,7 +197,11 @@ get_download_url() {
 
 URL=$(get_download_url) || die "Could not fetch release info. Visit https://github.com/ekolokonet/ekoloko-desktop-app/releases"
 [ -n "$URL" ] || die "Could not find an AppImage in the latest release."
-ok "Latest: $(basename "$URL")"
+if [ -n "$PINNED_VERSION" ] && [ $SKIP_PIN -eq 0 ]; then
+    ok "Pinned release: $(basename "$URL")"
+else
+    ok "Latest: $(basename "$URL")"
+fi
 
 # --- download and verify
 
@@ -240,6 +250,7 @@ find_binary() {
 
     # Fallback: find first ELF executable that's not a library
     for f in "$TMP/squashfs-root"/*; do
+        # shellcheck disable=SC2015
         [ -f "$f" ] && [ -x "$f" ] || continue
         base=$(basename "$f")
         case "$base" in
@@ -458,7 +469,7 @@ add_to_path() {
     fi
 
     # Already has the path?
-    if grep -q "['\"]$bin_dir['\"]" "$shell_rc" || grep -q "\.local/bin" "$shell_rc"; then
+    if grep -q "['\"]${bin_dir}['\"]" "$shell_rc" || grep -q "\.local/bin" "$shell_rc"; then
         return 0
     fi
 
