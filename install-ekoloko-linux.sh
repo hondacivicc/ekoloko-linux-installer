@@ -245,6 +245,11 @@ ensure_sandbox() {
 
     if command -v bwrap >/dev/null 2>&1; then
         ok "Installed bubblewrap."
+        # A fresh bwrap on Ubuntu 23.10+/24.04 usually can't create user
+        # namespaces yet; offer the fix now instead of at first launch.
+        if ! bwrap --ro-bind / / --unshare-user -- /bin/true >/dev/null 2>&1; then
+            offer_userns_fix
+        fi
     else
         warn "Couldn't install a sandbox. The app will run without confinement, so any exploit has full account access. Install bubblewrap or firejail and re-run."
     fi
