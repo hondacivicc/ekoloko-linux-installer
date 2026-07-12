@@ -212,27 +212,35 @@ ensure_sandbox() {
         return 0
     fi
 
-    info "No sandbox found. Installing bubblewrap (needs sudo)..."
+    info "No sandbox found."
 
-    # Only try sudo if interactive
-    if [ ! -t 0 ]; then
-        warn "Not running interactively, skipping sudo install. Please install bubblewrap or firejail manually."
+    # stdin is a pipe under 'curl | bash', so [ -t 0 ] would always bail;
+    # ask on /dev/tty like the userns fix does. sudo prompts there anyway.
+    local reply
+    if ! { read -r -p "Install bubblewrap with sudo now? [Y/n] " reply < /dev/tty; } 2>/dev/null; then
+        warn "No terminal to ask on. Install bubblewrap or firejail manually and re-run."
         return 0
     fi
+    case "$reply" in
+        [nN]*)
+            warn "Skipped. Install bubblewrap or firejail manually and re-run."
+            return 0
+            ;;
+    esac
 
     if command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --needed --noconfirm bubblewrap || true
+        sudo pacman -S --needed --noconfirm bubblewrap < /dev/tty || true
     elif command -v apt-get >/dev/null 2>&1; then
         # shellcheck disable=SC2015
-        sudo apt-get update -qq && sudo apt-get install -y bubblewrap || true
+        sudo apt-get update -qq < /dev/tty && sudo apt-get install -y bubblewrap < /dev/tty || true
     elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y bubblewrap || true
+        sudo dnf install -y bubblewrap < /dev/tty || true
     elif command -v zypper >/dev/null 2>&1; then
-        sudo zypper install -y bubblewrap || true
+        sudo zypper install -y bubblewrap < /dev/tty || true
     elif command -v apk >/dev/null 2>&1; then
-        sudo apk add bubblewrap || true
+        sudo apk add bubblewrap < /dev/tty || true
     elif command -v xbps-install >/dev/null 2>&1; then
-        sudo xbps-install -S bubblewrap || true
+        sudo xbps-install -S bubblewrap < /dev/tty || true
     fi
 
     if command -v bwrap >/dev/null 2>&1; then
