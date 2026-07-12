@@ -110,7 +110,10 @@ If something breaks, the logs are at `~/.config/ekoloko-rewritten/logs/ekoloko.l
 
 **`bwrap: setting up uid map: Permission denied`** — your system blocks
 unprivileged user namespaces (common on Ubuntu 23.10+ and some Fedora/Debian).
-Enable them, then re-run `ekoloko`:
+The installer detects this, picks the right sysctl for your distro and offers
+to apply it during install (it asks first — the change needs sudo and persists
+across reboots). If you skipped that, enable them manually, then re-run
+`ekoloko`:
 
 ```bash
 # Ubuntu 23.10+ / 24.04

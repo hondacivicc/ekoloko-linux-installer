@@ -119,18 +119,80 @@ fi
 
 # --- ensure sandbox tool
 
+# When bubblewrap can't create user namespaces the sandbox can't start
+# ("bwrap: setting up uid map: Permission denied"). The fix is one sysctl,
+# but which one depends on the distro; detect the knob this system needs.
+userns_sysctl_needed() {
+    if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ] &&
+       [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" != "0" ]; then
+        echo "kernel.apparmor_restrict_unprivileged_userns=0"   # Ubuntu 23.10+
+    elif [ -f /proc/sys/kernel/unprivileged_userns_clone ] &&
+         [ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)" = "0" ]; then
+        echo "kernel.unprivileged_userns_clone=1"               # Debian
+    elif [ -f /proc/sys/user/max_user_namespaces ] &&
+         [ "$(cat /proc/sys/user/max_user_namespaces 2>/dev/null)" = "0" ]; then
+        echo "user.max_user_namespaces=15000"                   # Fedora / RHEL
+    fi
+}
+
+# Offer to apply the userns fix now instead of only printing instructions.
+# It loosens a system hardening knob and needs sudo, so it never applies
+# without an explicit yes, and skipping just leaves the manual steps.
+offer_userns_fix() {
+    local setting reply
+    setting=$(userns_sysctl_needed)
+
+    warn "bubblewrap can't create user namespaces, so the sandbox can't start"
+    warn "(common on Ubuntu 23.10+/24.04 and some Fedora/Debian setups)."
+
+    if [ -z "$setting" ]; then
+        warn "See the README's troubleshooting section for the fix, or install firejail."
+        return 0
+    fi
+
+    warn "The fix writes '$setting' to /etc/sysctl.d/60-userns.conf"
+    warn "(persists across reboots, needs sudo). You can also skip it and use firejail."
+
+    # Ask on the terminal itself so this also works via 'curl | bash'.
+    if ! { read -r -p "Apply the fix now? [y/N] " reply < /dev/tty; } 2>/dev/null; then
+        warn "No terminal to ask on; apply it later with:"
+        warn "  echo '$setting' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system"
+        return 0
+    fi
+
+    case "$reply" in
+        [yY]*)
+            if echo "$setting" | sudo tee /etc/sysctl.d/60-userns.conf >/dev/null \
+               && sudo sysctl --system >/dev/null; then
+                if bwrap --ro-bind / / --unshare-user -- /bin/true >/dev/null 2>&1; then
+                    ok "User namespaces enabled; the bubblewrap sandbox works now."
+                else
+                    warn "Applied, but bubblewrap still can't create user namespaces; see the README."
+                fi
+            else
+                warn "Couldn't apply the sysctl. Do it manually:"
+                warn "  echo '$setting' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system"
+            fi
+            ;;
+        *)
+            warn "Skipped. Apply it later with:"
+            warn "  echo '$setting' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system"
+            warn "(or install firejail; the launcher uses it automatically)"
+            ;;
+    esac
+}
+
 ensure_sandbox() {
     if command -v bwrap >/dev/null 2>&1; then
         ok "Sandbox: bubblewrap"
-        # Warn now if unprivileged user namespaces are blocked (Ubuntu 24.04,
-        # some Fedora/Debian). The launcher prints full fix steps at runtime.
+        # Unprivileged user namespaces blocked (Ubuntu 24.04, some
+        # Fedora/Debian): offer the sysctl fix right away rather than
+        # letting the first launch fail.
         if ! bwrap --ro-bind / / --unshare-user -- /bin/true >/dev/null 2>&1; then
             if command -v firejail >/dev/null 2>&1; then
                 warn "bubblewrap can't use user namespaces here; firejail will be used instead."
             else
-                warn "bubblewrap can't create user namespaces (common on Ubuntu 24.04)."
-                warn "Fix now:  echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system"
-                warn "(Debian: kernel.unprivileged_userns_clone=1 / Fedora: user.max_user_namespaces=15000; or: sudo chmod u+s \"\$(command -v bwrap)\")"
+                offer_userns_fix
             fi
         fi
         return 0
@@ -296,6 +358,126 @@ elif [ -f "$DLL_DIR/pepflashplayer.dll" ]; then
 else
     warn "No Linux Flash plugin found in this release; Flash may not work."
 fi
+
+# --- apply view-bounds fix
+#
+# The app maximizes its window right after creating it and immediately sizes
+# the game BrowserView from the window's content bounds. On compositors that
+# apply the maximize asynchronously (Hyprland, sway, other tiling/Wayland
+# WMs), those bounds are still the default 800x600, so the game sits small
+# in the top-left corner until the window is resized by hand. Electron loads
+# resources/app in preference to resources/app.asar, so drop in a tiny shim
+# that runs the original app unchanged and re-syncs the view bounds after
+# startup, after resizes, and once after the game page loads.
+
+apply_view_bounds_fix() {
+    local shim_dir="$TMP/squashfs-root/resources/app"
+    local asar="$TMP/squashfs-root/resources/app.asar"
+
+    [ -f "$asar" ] || { warn "No app.asar found; skipping view-bounds fix."; return 0; }
+
+    mkdir -p "$shim_dir"
+
+    # The shim needs the app's own package.json next to it so the app keeps
+    # its real name and version (the updater compares versions, and userData
+    # paths derive from the name). Read it straight out of the asar header;
+    # fall back to a minimal one built from the binary name and release tag.
+    if command -v python3 >/dev/null 2>&1 && python3 - "$asar" > "$shim_dir/package.json" <<'PYEOF'
+import json, struct, sys
+with open(sys.argv[1], "rb") as f:
+    f.seek(4)
+    header_size = struct.unpack("<I", f.read(4))[0]
+    f.seek(12)
+    json_len = struct.unpack("<I", f.read(4))[0]
+    header = json.loads(f.read(json_len))
+    entry = header["files"]["package.json"]
+    f.seek(8 + header_size + int(entry["offset"]))
+    sys.stdout.buffer.write(f.read(int(entry["size"])))
+PYEOF
+    then
+        : # got the original package.json
+    else
+        local ver
+        ver=$(basename "$URL" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        printf '{"name":"%s","version":"%s","main":"main.js"}\n' \
+            "$BIN_NAME" "${ver:-0.0.0}" > "$shim_dir/package.json"
+        warn "python3 not found; wrote a minimal package.json for the shim."
+    fi
+
+    cat > "$shim_dir/main.js" <<'SHIM_EOF'
+// ekoloko view-bounds fix (added by the linux installer).
+//
+// The app maximizes its window right after creating it and sizes the game
+// BrowserView from the window's content bounds. On compositors that apply
+// the maximize asynchronously (Hyprland, sway, other tiling/Wayland WMs)
+// the view keeps its pre-maximize 800x600 size and the game renders small
+// in the top-left corner until the window is resized by hand. This shim
+// loads the real app from app.asar unchanged and re-syncs the view bounds
+// where the app trusts them too early.
+
+const path = require("path");
+const { app } = require("electron");
+
+// Control bar height; must match setViewBounds() in the app's main.js.
+const BAR_HEIGHT = 100;
+
+function wantedBounds(win) {
+  const c = win.getContentBounds();
+  return {
+    x: 0,
+    y: BAR_HEIGHT,
+    width: c.width,
+    height: Math.max(0, c.height - BAR_HEIGHT),
+  };
+}
+
+function syncViewBounds(win) {
+  if (win.isDestroyed()) return;
+  const view = win.getBrowserView && win.getBrowserView();
+  if (view) view.setBounds(wantedBounds(win));
+}
+
+// The page may have laid out while the view was still 800x600, and setting
+// identical bounds produces no resize event, so bounce the height by 1px to
+// force Flash to recompute its stage size against the real view.
+function nudgeView(win) {
+  if (win.isDestroyed()) return;
+  const view = win.getBrowserView && win.getBrowserView();
+  if (!view) return;
+  const want = wantedBounds(win);
+  view.setBounds({ x: want.x, y: want.y, width: want.width, height: want.height + 1 });
+  setTimeout(() => syncViewBounds(win), 60);
+}
+
+app.on("browser-window-created", (_event, win) => {
+  // The game view is attached right after the window is constructed.
+  setImmediate(() => {
+    if (win.isDestroyed()) return;
+    if (!(win.getBrowserView && win.getBrowserView())) return; // popups have no view
+
+    // The maximize can land well after startup; keep re-syncing briefly.
+    [300, 700, 1500, 3000, 6000].forEach((ms) =>
+      setTimeout(() => syncViewBounds(win), ms)
+    );
+
+    // Compositor-driven resizes can report stale bounds inside the app's
+    // own resize handler; re-check after they settle.
+    win.on("resize", () => setTimeout(() => syncViewBounds(win), 150));
+
+    // Once the game page has loaded, deliver one real resize so it lays
+    // out against the final view size, not the one it loaded into.
+    win.getBrowserView().webContents.on("did-finish-load", () =>
+      setTimeout(() => nudgeView(win), 500)
+    );
+  });
+});
+
+require(path.join(process.resourcesPath, "app.asar"));
+SHIM_EOF
+
+    ok "View-bounds fix applied (resources/app shim)."
+}
+apply_view_bounds_fix
 
 # --- install app (preserve user data)
 
@@ -488,11 +670,14 @@ run_bwrap() {
 }
 
 run_firejail() {
+    # --private mounts $HOME_JAIL over $HOME, and the command runs inside
+    # that mount namespace, so the binary must be addressed as $HOME/app/...
+    # ($HOME_JAIL/app/... no longer exists from the sandbox's view).
     exec firejail --quiet --noprofile \
         --private="$HOME_JAIL" --private-tmp \
         --caps.drop=all --nonewprivs --noroot --seccomp \
         --protocol=unix,inet,inet6,netlink --disable-mnt \
-        "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
+        "$HOME/app/$BIN_NAME" --no-sandbox "$@"
 }
 
 # Probe whether bubblewrap can actually create a user namespace. On systems
