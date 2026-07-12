@@ -3,7 +3,7 @@
 Gets the official ekoloko desktop client running on linux and keeps it in a sandbox.
 
 The linux AppImage (1.0.20) has a few bugs that make Flash fail with "Couldn't
-load plugin". This script pulls the latest release from GitHub and patches
+load plugin". This script pulls the official release from GitHub and patches
 around them.
 
 ## install
@@ -22,8 +22,11 @@ cd ekoloko-linux-installer
 
 Then run `ekoloko`, or find it in your app menu.
 
-To update, just run the script again (it always grabs the latest release). To
-remove it: `./install-ekoloko-linux.sh --uninstall`.
+The download is pinned to a known release and checksum-verified; use
+`--latest` if you want the newest upstream release instead.
+
+To update, just run the script again. To remove it:
+`./install-ekoloko-linux.sh --uninstall`.
 
 Everything lives under `~/.local/share/ekoloko` (the app plus its sandbox home),
 `~/.local/bin/ekoloko` for the launcher, and one `.desktop` file. Uninstall

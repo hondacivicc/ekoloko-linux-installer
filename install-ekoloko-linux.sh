@@ -29,11 +29,15 @@ LAUNCHER="$BIN_DIR/ekoloko"
 DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICON_PATH="${XDG_DATA_HOME:-$HOME/.local/share}/icons/ekoloko.png"
 
-# Optional version pinning. Set both to enforce a specific release version.
-# When pinned, the installer fetches that release tag instead of latest,
-# and verifies the AppImage SHA256. Set PINNED_VERSION="" to disable.
-PINNED_VERSION=""
-PINNED_SHA256=""
+# Version pinning: the installer fetches this exact release tag and verifies
+# the AppImage against this SHA256 before doing anything with it. This is the
+# default so a compromised upstream release (or a tampered download) dies at
+# the checksum instead of reaching the user's disk as a runnable app. Pass
+# --latest to fetch the newest upstream release without verification.
+# When upstream publishes a new release, update both values together:
+#   curl -fL <AppImage url> | sha256sum
+PINNED_VERSION="v1.0.20"
+PINNED_SHA256="9c131f2e6e5b89d66e65b57bdebd2fe12e0c23729c1280d783641514eecb049f"
 
 # --- functions
 
@@ -50,7 +54,8 @@ Usage:
   ./install-ekoloko-linux.sh              Install or update ekoloko
   ./install-ekoloko-linux.sh --uninstall  Remove ekoloko (keep sandbox home)
   ./install-ekoloko-linux.sh --purge      Remove everything including data
-  ./install-ekoloko-linux.sh --latest     Skip version pinning if set
+  ./install-ekoloko-linux.sh --latest     Fetch newest upstream release
+                                          (skips checksum verification)
   ./install-ekoloko-linux.sh --help       Show this help
 
 Environment:
@@ -237,6 +242,27 @@ ensure_sandbox() {
 }
 ensure_sandbox
 
+# --- skip download when the pinned release is already installed
+#
+# Re-runs still rewrite the launcher and desktop entry below (those change
+# between installer versions), but don't re-fetch a 60 MB AppImage that's
+# already on disk and was checksum-verified when it arrived.
+
+VERSION_FILE="$HOME_JAIL/.installed-release"
+SKIP_DOWNLOAD=0
+if [ -n "$PINNED_VERSION" ] && [ $SKIP_PIN -eq 0 ] && [ -f "$VERSION_FILE" ]; then
+    read -r INST_VER INST_BIN < "$VERSION_FILE" || true
+    if [ "${INST_VER:-}" = "$PINNED_VERSION" ] && [ -n "${INST_BIN:-}" ] && [ -x "$APP/$INST_BIN" ]; then
+        BIN_NAME="$INST_BIN"
+        SKIP_DOWNLOAD=1
+        ok "Pinned release $PINNED_VERSION already installed; skipping download."
+    fi
+fi
+
+# The body of this if spans everything from the release lookup through the
+# app install; it is deliberately not indented to keep the sections readable.
+if [ $SKIP_DOWNLOAD -eq 0 ]; then
+
 # --- fetch release
 
 info "Looking up release of $REPO"
@@ -253,7 +279,7 @@ get_download_url() {
         release_url="https://api.github.com/repos/$REPO/releases/latest"
     fi
 
-    if ! api_response=$(fetch_text "$release_url" 2>&1); then
+    if ! api_response=$(fetch_text "$release_url" 2>/dev/null); then
         return 1
     fi
 
@@ -300,9 +326,75 @@ if [ -n "$PINNED_VERSION" ] && [ -n "$PINNED_SHA256" ] && [ $SKIP_PIN -eq 0 ]; t
 fi
 
 # --- extract
+#
+# Never run the downloaded file on the host: --appimage-extract executes the
+# AppImage's own embedded runtime, which defeats the point of sandboxing the
+# app later. A type-2 AppImage is an ELF stub with a squashfs image appended
+# right after the section headers, so read the image out with unsquashfs and
+# never execute anything. Where squashfs-tools isn't installed, fall back to
+# running --appimage-extract inside bubblewrap/firejail (no network, read-only
+# system, throwaway home). If neither is possible, stop rather than execute
+# an unverified download unconfined.
 
-info "Extracting AppImage"
-( cd "$TMP" && ./app.AppImage --appimage-extract >/dev/null 2>&1 ) || die "AppImage extraction failed."
+# Offset of the appended squashfs: e_shoff + e_shentsize * e_shnum, read
+# straight from the ELF64 header (fields at 0x28, 0x3a, 0x3c).
+squashfs_offset() {
+    local shoff shentsize shnum
+    shoff=$(od -A n -t u8 -j 40 -N 8 "$1" | tr -d ' ')
+    shentsize=$(od -A n -t u2 -j 58 -N 2 "$1" | tr -d ' ')
+    shnum=$(od -A n -t u2 -j 60 -N 2 "$1" | tr -d ' ')
+    [ -n "$shoff" ] && [ -n "$shentsize" ] && [ -n "$shnum" ] || return 1
+    echo $((shoff + shentsize * shnum))
+}
+
+extract_unsquashfs() {
+    local offset
+    offset=$(squashfs_offset "$TMP/app.AppImage") || return 1
+    # The squashfs magic ("hsqs") must sit exactly at the computed offset.
+    [ "$(od -A n -c -j "$offset" -N 4 "$TMP/app.AppImage" | tr -d ' ')" = "hsqs" ] || return 1
+    tail -c +$((offset + 1)) "$TMP/app.AppImage" > "$TMP/app.squashfs" || return 1
+    unsquashfs -q -d "$TMP/squashfs-root" "$TMP/app.squashfs" >/dev/null 2>&1 || return 1
+    rm -f "$TMP/app.squashfs"
+}
+
+extract_bwrap() {
+    command -v bwrap >/dev/null 2>&1 || return 1
+    local d
+    local -a a=(
+        --die-with-parent --new-session --unshare-all --clearenv
+        --ro-bind /usr /usr
+        --proc /proc --dev /dev --tmpfs /tmp
+        --bind "$TMP" /work --chdir /work
+        --setenv HOME /tmp --setenv PATH /usr/bin:/bin
+    )
+    for d in /lib /lib64 /lib32 /libx32 /bin /sbin; do
+        if [ -L "$d" ]; then
+            a+=( --symlink "$(readlink "$d")" "$d" )
+        elif [ -d "$d" ]; then
+            a+=( --ro-bind "$d" "$d" )
+        fi
+    done
+    bwrap "${a[@]}" -- /work/app.AppImage --appimage-extract >/dev/null 2>&1
+}
+
+extract_firejail() {
+    command -v firejail >/dev/null 2>&1 || return 1
+    firejail --quiet --noprofile --net=none --private="$TMP" --private-tmp \
+        --caps.drop=all --nonewprivs --noroot --seccomp --disable-mnt \
+        bash -c 'cd "$HOME" && ./app.AppImage --appimage-extract' >/dev/null 2>&1
+}
+
+info "Extracting AppImage (without running it on the host)"
+if command -v unsquashfs >/dev/null 2>&1 && extract_unsquashfs; then
+    ok "Extracted with unsquashfs."
+elif rm -rf "$TMP/squashfs-root" && extract_bwrap; then
+    ok "Extracted inside the bubblewrap sandbox."
+elif rm -rf "$TMP/squashfs-root" && extract_firejail; then
+    ok "Extracted inside the firejail sandbox."
+else
+    rm -rf "$TMP/squashfs-root"
+    die "Can't extract the AppImage safely: extraction executes code from the download, so it only happens via unsquashfs or inside a sandbox. Install squashfs-tools (unsquashfs), or a working bubblewrap/firejail, and re-run."
+fi
 [ -d "$TMP/squashfs-root" ] || die "Extracted directory not found; AppImage may be corrupt."
 
 # Verify essential structure before swapping
@@ -484,15 +576,29 @@ SHIM_EOF
 apply_view_bounds_fix
 
 # --- install app (preserve user data)
+#
+# Stage the new tree next to the old one first: the mv out of $TMP crosses
+# filesystems (a copy that can fail mid-way), so never delete the working
+# install until the replacement is fully on the same disk. The final swap is
+# two same-filesystem renames.
+
+mkdir -p "$HOME_JAIL"
+rm -rf "$HOME_JAIL/app.new" "$HOME_JAIL/app.old"
+mv "$TMP/squashfs-root" "$HOME_JAIL/app.new"
 
 if [ -d "$APP" ]; then
     info "Updating app (preserving sandbox home)..."
-    rm -rf "$APP"
+    mv "$APP" "$HOME_JAIL/app.old"
 fi
-
-mkdir -p "$HOME_JAIL"
-mv "$TMP/squashfs-root" "$APP"
+mv "$HOME_JAIL/app.new" "$APP"
+rm -rf "$HOME_JAIL/app.old"
 ok "Installed to $APP"
+
+# Record what's installed so re-runs of the same pin skip the download.
+TAG=$(echo "$URL" | sed -n 's|.*/releases/download/\([^/]*\)/.*|\1|p')
+printf '%s %s\n' "${TAG:-unknown}" "$BIN_NAME" > "$VERSION_FILE"
+
+fi # SKIP_DOWNLOAD (end of download & install)
 
 # --- check runtime libraries
 #
@@ -500,12 +606,40 @@ ok "Installed to $APP"
 # system doesn't have shows up as a crash on launch ("cannot open shared
 # object file"). Catch them all now with ldd instead of one at a time. On
 # Ubuntu note that `apt install chromium` is a snap and installs no libs.
+#
+# ldd is not safe to run on an untrusted binary: it executes the dynamic
+# loader named in the binary's own PT_INTERP, which a hostile ELF can point
+# at itself. Run it inside the sandbox (no network, read-only system, real
+# home hidden); if no sandbox works, skip the check rather than risk it.
+
+safe_ldd() {
+    if command -v bwrap >/dev/null 2>&1 \
+       && bwrap --ro-bind / / --unshare-user -- /bin/true >/dev/null 2>&1; then
+        bwrap --die-with-parent --new-session --unshare-all --clearenv \
+            --ro-bind / / --tmpfs /tmp --tmpfs "$HOME" \
+            --ro-bind "$APP" "$APP" \
+            --setenv PATH /usr/bin:/bin \
+            -- ldd "$1" 2>/dev/null
+    elif command -v firejail >/dev/null 2>&1; then
+        firejail --quiet --noprofile --net=none --private-tmp \
+            --caps.drop=all --nonewprivs --noroot --seccomp \
+            --read-only="$HOME" ldd "$1" 2>/dev/null
+    else
+        return 1
+    fi
+}
 
 check_runtime_libs() {
     command -v ldd >/dev/null 2>&1 || return 0
 
-    local missing
-    missing=$(ldd "$APP/$BIN_NAME" 2>/dev/null | awk '/not found/ {print $1}' | sort -u || true)
+    local out missing
+    out=$(safe_ldd "$APP/$BIN_NAME" || true)
+    if [ -z "$out" ]; then
+        warn "Skipped the runtime-library check (needs a working sandbox to run ldd safely)."
+        return 0
+    fi
+
+    missing=$(echo "$out" | awk '/not found/ {print $1}' | sort -u)
 
     if [ -z "$missing" ]; then
         ok "Runtime libraries: all present."
@@ -552,10 +686,11 @@ set -euo pipefail
 
 LAUNCHER_EOF
 
-# Inject installer-time variables
+# Inject installer-time variables (%q so quotes/spaces in paths can't break
+# or alter the generated script)
 cat >> "$LAUNCHER" <<LAUNCHER_VARS
-HOME_JAIL="$HOME_JAIL"
-BIN_NAME="$BIN_NAME"
+HOME_JAIL=$(printf '%q' "$HOME_JAIL")
+BIN_NAME=$(printf '%q' "$BIN_NAME")
 LAUNCHER_VARS
 
 cat >> "$LAUNCHER" <<'LAUNCHER_EOF'
@@ -580,12 +715,11 @@ run_bwrap() {
         --ro-bind-try /etc/resolv.conf /etc/resolv.conf
         --ro-bind-try /etc/fonts /etc/fonts
         --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache
-        --ro-bind-try /etc/passwd /etc/passwd
-        --ro-bind-try /etc/group /etc/group
+        --ro-bind-data 8 /etc/passwd
+        --ro-bind-data 9 /etc/group
         --ro-bind-try /etc/localtime /etc/localtime
         --ro-bind-try /run/systemd/resolve /run/systemd/resolve
         --ro-bind-try /run/NetworkManager /run/NetworkManager
-        --ro-bind-try /opt /opt
         --proc /proc
         --dev /dev
         --tmpfs /tmp
@@ -616,11 +750,12 @@ run_bwrap() {
         [ -e "$nv_dev" ] && a+=( --dev-bind-try "$nv_dev" "$nv_dev" )
     done
 
-    # Runtime directory: use resolved path or fallback to temp
+    # Runtime directory: use resolved path or fallback to temp. No cleanup
+    # trap: exec replaces this shell, so a trap would never fire anyway;
+    # the dir sits under /tmp and the OS reclaims it.
     local rt_to_use="$RT"
     if [ ! -d "$RT" ] || [ ! -w "$RT" ]; then
         rt_to_use=$(mktemp -d)
-        trap 'rm -rf "$rt_to_use"' EXIT
     fi
     a+=( --dir "$rt_to_use" --chmod 0700 "$rt_to_use" )
 
@@ -636,9 +771,14 @@ run_bwrap() {
     # X11 socket
     [ -d /tmp/.X11-unix ] && a+=( --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix )
 
-    # Home and environment
+    # Home and environment. The jail home is writable (the game saves state
+    # there), but the app's own code is remounted read-only on top: a
+    # compromised game process must not be able to trojan the binary or the
+    # shim that every future launch (possibly unconfined via
+    # EKOLOKO_NO_JAIL=1) would execute.
     a+=(
         --bind "$HOME_JAIL" "$HOME"
+        --ro-bind "$HOME_JAIL/app" "$HOME/app"
         --setenv HOME "$HOME"
         --setenv USER "${USER:-user}"
         --setenv PATH /usr/bin:/bin
@@ -649,10 +789,29 @@ run_bwrap() {
     # X11 auth cookie: on X11/Xwayland the server checks a MIT-MAGIC-COOKIE
     # from ~/.Xauthority. That lives in your real home, but the jail gets a
     # throwaway one, so without this the app fails with "Authorization
-    # required ... cannot open display". Bind the host's cookie in read-only.
+    # required ... cannot open display".
+    #
+    # Prefer an *untrusted*-scope cookie (SECURITY extension): with the real
+    # trusted cookie, any X11 client can inject synthetic input into other
+    # windows and read them, which is the easy escape from any X11 sandbox.
+    # Xwayland and some servers don't support SECURITY; fall back to binding
+    # the real cookie there. EKOLOKO_TRUSTED_X11=1 forces the real cookie if
+    # the game misbehaves under the untrusted one.
+    local x_untrusted=0
     if [ -n "${DISPLAY:-}" ]; then
         local xauth_src="${XAUTHORITY:-$HOME/.Xauthority}"
-        if [ -f "$xauth_src" ]; then
+        local xauth_jail="$HOME_JAIL/.Xauthority-untrusted"
+        if [ "${EKOLOKO_TRUSTED_X11:-0}" != "1" ] \
+           && command -v xauth >/dev/null 2>&1 \
+           && rm -f "$xauth_jail" \
+           && xauth -f "$xauth_jail" generate "$DISPLAY" . untrusted timeout 0 >/dev/null 2>&1 \
+           && [ -s "$xauth_jail" ]; then
+            x_untrusted=1
+            a+=(
+                --ro-bind "$xauth_jail" "$HOME/.Xauthority"
+                --setenv XAUTHORITY "$HOME/.Xauthority"
+            )
+        elif [ -f "$xauth_src" ]; then
             a+=(
                 --ro-bind "$xauth_src" "$HOME/.Xauthority"
                 --setenv XAUTHORITY "$HOME/.Xauthority"
@@ -665,20 +824,29 @@ run_bwrap() {
     [ -n "${DISPLAY:-}" ] && a+=( --setenv DISPLAY "$DISPLAY" )
     [ -n "${XDG_SESSION_TYPE:-}" ] && a+=( --setenv XDG_SESSION_TYPE "$XDG_SESSION_TYPE" )
 
-    # X11 access warning
-    if [ -n "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-        echo "Warning: X11 session; X11 clients can observe keystrokes and screenshots from the app." >&2
+    # X11 access warning (only when the trusted cookie is in use)
+    if [ -n "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ "$x_untrusted" -eq 0 ]; then
+        echo "Warning: X11 session with a trusted cookie; the app can observe and inject input into other windows." >&2
     fi
 
-    exec bwrap "${a[@]}" "$HOME/app/$BIN_NAME" --no-sandbox "$@"
+    # fd 8/9 feed --ro-bind-data: a two-user passwd/group so the app can
+    # resolve its own uid without seeing the host's account list.
+    exec bwrap "${a[@]}" "$HOME/app/$BIN_NAME" --no-sandbox "$@" \
+        8< <(printf 'root:x:0:0::/root:/usr/bin/false\n%s:x:%s:%s::%s:/usr/bin/false\n' \
+                "${USER:-user}" "$(id -u)" "$(id -g)" "$HOME") \
+        9< <(printf 'root:x:0:\n%s:x:%s:\n' "${USER:-user}" "$(id -g)")
 }
 
 run_firejail() {
     # --private mounts $HOME_JAIL over $HOME, and the command runs inside
     # that mount namespace, so the binary must be addressed as $HOME/app/...
     # ($HOME_JAIL/app/... no longer exists from the sandbox's view).
+    # --read-only keeps the app's own code immutable from inside the jail,
+    # matching the bwrap setup: a compromised game can't trojan the binary
+    # that future launches execute.
     exec firejail --quiet --noprofile \
         --private="$HOME_JAIL" --private-tmp \
+        --read-only="$HOME/app" \
         --caps.drop=all --nonewprivs --noroot --seccomp \
         --protocol=unix,inet,inet6,netlink --disable-mnt \
         "$HOME/app/$BIN_NAME" --no-sandbox "$@"
