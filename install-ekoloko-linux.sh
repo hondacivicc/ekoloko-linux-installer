@@ -460,6 +460,20 @@ run_bwrap() {
         --setenv LANG "${LANG:-C.UTF-8}"
     )
 
+    # X11 auth cookie: on X11/Xwayland the server checks a MIT-MAGIC-COOKIE
+    # from ~/.Xauthority. That lives in your real home, but the jail gets a
+    # throwaway one, so without this the app fails with "Authorization
+    # required ... cannot open display". Bind the host's cookie in read-only.
+    if [ -n "${DISPLAY:-}" ]; then
+        local xauth_src="${XAUTHORITY:-$HOME/.Xauthority}"
+        if [ -f "$xauth_src" ]; then
+            a+=(
+                --ro-bind "$xauth_src" "$HOME/.Xauthority"
+                --setenv XAUTHORITY "$HOME/.Xauthority"
+            )
+        fi
+    fi
+
     # Session environment (only if set to avoid blank expansions)
     [ -n "${WAYLAND_DISPLAY:-}" ] && a+=( --setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY" )
     [ -n "${DISPLAY:-}" ] && a+=( --setenv DISPLAY "$DISPLAY" )
