@@ -714,10 +714,62 @@ fix below (each persists across reboots), then re-run: ekoloko
   Or install firejail (used automatically if present):
     sudo apt install firejail   # or dnf/pacman/zypper
 
-To run right now WITHOUT the sandbox (LESS SECURE: the app runs unconfined
+To skip the sandbox permanently (LESS SECURE: the app runs unconfined
 with your account's full access):
     EKOLOKO_NO_JAIL=1 ekoloko
 MSG
+}
+
+# True when we can talk to the user on a terminal. test -r isn't enough:
+# /dev/tty is mode 666 so access() always passes, but opening it fails
+# with ENXIO when there's no controlling terminal (desktop icon launch).
+have_tty() {
+    (exec < /dev/tty) 2>/dev/null
+}
+
+# Ask before running without the sandbox. Terminal launch: y/N prompt on
+# /dev/tty. Desktop launch (no tty): GUI dialog, trying the tools distros
+# actually ship (zenity on GNOME/GTK, kdialog on KDE, yad, xmessage).
+# Every path defaults to NO, and if there's no way to ask at all we refuse
+# to run rather than drop confinement without consent (a notification says
+# why, if notify-send exists). Returns 0 only on an explicit yes.
+confirm_unconfined() {
+    local msg="$1" q reply=""
+    if have_tty; then
+        printf '%s\n' "$msg" > /dev/tty
+        printf 'Play anyway WITHOUT the sandbox (full access to your files)? [y/N] ' > /dev/tty
+        IFS= read -r reply < /dev/tty || true
+        case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; esac
+        return 1
+    fi
+    q="$msg
+
+Without the sandbox the game runs with your account's full access."
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --question --default-cancel --title="ekoloko" \
+            --ok-label="Play anyway" --cancel-label="Don't play" \
+            --text="$q" 2>/dev/null
+        return $?
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "ekoloko" \
+            --warningcontinuecancel "$q
+Continue = play without the sandbox." 2>/dev/null
+        return $?
+    elif command -v yad >/dev/null 2>&1; then
+        yad --title="ekoloko" --image=dialog-warning --center \
+            --button="Play anyway:0" --button="Don't play:1" \
+            --text="$q" 2>/dev/null
+        return $?
+    elif command -v xmessage >/dev/null 2>&1; then
+        xmessage -center -default "Don't play" \
+            -buttons "Don't play:1,Play anyway:0" "$q" 2>/dev/null
+        return $?
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "ekoloko" \
+            "$msg Not starting: found no dialog tool to ask you with. Run 'ekoloko' from a terminal, or EKOLOKO_NO_JAIL=1 ekoloko to skip the sandbox." 2>/dev/null || true
+    fi
+    return 1
 }
 
 # Main dispatcher
@@ -729,13 +781,19 @@ elif command -v firejail >/dev/null 2>&1; then
     # bwrap missing or userns blocked; firejail is setuid so it still works.
     run_firejail "$@"
 elif command -v bwrap >/dev/null 2>&1; then
-    # bwrap present but user namespaces are blocked, and no firejail fallback.
-    # Don't silently drop confinement: guide the user to a real fix.
-    userns_help
+    # bwrap present but user namespaces are blocked, and no firejail
+    # fallback. Explain the real fix, then let the user decide whether to
+    # play unconfined this once.
+    have_tty && userns_help
+    if confirm_unconfined "The sandbox can't start: your system blocks unprivileged user namespaces. See the README's troubleshooting for the permanent fix, or install firejail."; then
+        exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
+    fi
     exit 1
 else
-    echo "ekoloko: no sandbox (bwrap/firejail) found; running unconfined." >&2
-    exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
+    if confirm_unconfined "No sandbox is installed (bubblewrap or firejail). Install one so the game runs confined."; then
+        exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
+    fi
+    exit 1
 fi
 LAUNCHER_EOF
 

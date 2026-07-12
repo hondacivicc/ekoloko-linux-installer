@@ -84,6 +84,12 @@ needs for graphics and sound. Nothing else from your account is mounted.
 
 If you ever need to run it without the sandbox: `EKOLOKO_NO_JAIL=1 ekoloko`.
 
+If no working sandbox is available at launch (bwrap blocked, or neither bwrap
+nor firejail installed), the launcher never drops confinement silently: it
+asks first. From a terminal that's a y/N prompt; from the desktop icon it's a
+popup (zenity, kdialog, yad or xmessage — whichever the system has). If it has
+no way to ask, it refuses to start and sends a desktop notification saying why.
+
 ## the bugs it works around
 
 1. Wrong Flash plugin path. `main.js` only handles the Windows path in its
