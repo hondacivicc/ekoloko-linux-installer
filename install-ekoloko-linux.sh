@@ -122,6 +122,17 @@ fi
 ensure_sandbox() {
     if command -v bwrap >/dev/null 2>&1; then
         ok "Sandbox: bubblewrap"
+        # Warn now if unprivileged user namespaces are blocked (Ubuntu 24.04,
+        # some Fedora/Debian). The launcher prints full fix steps at runtime.
+        if ! bwrap --ro-bind / / --unshare-user -- /bin/true >/dev/null 2>&1; then
+            if command -v firejail >/dev/null 2>&1; then
+                warn "bubblewrap can't use user namespaces here; firejail will be used instead."
+            else
+                warn "bubblewrap can't create user namespaces (common on Ubuntu 24.04)."
+                warn "Fix now:  echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system"
+                warn "(Debian: kernel.unprivileged_userns_clone=1 / Fedora: user.max_user_namespaces=15000; or: sudo chmod u+s \"\$(command -v bwrap)\")"
+            fi
+        fi
         return 0
     fi
     if command -v firejail >/dev/null 2>&1; then
@@ -417,13 +428,59 @@ run_firejail() {
         "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
 }
 
+# Probe whether bubblewrap can actually create a user namespace. On systems
+# that block unprivileged user namespaces (Ubuntu 23.10+/24.04 AppArmor, some
+# Fedora/Debian), bwrap fails with "setting up uid map: Permission denied".
+bwrap_works() {
+    bwrap --ro-bind / / --unshare-user -- /bin/true >/dev/null 2>&1
+}
+
+# Explain the userns restriction and how to fix it for the common distros.
+userns_help() {
+    cat >&2 <<'MSG'
+ekoloko: the bubblewrap sandbox can't start because your system blocks
+unprivileged user namespaces ("bwrap: setting up uid map: Permission denied").
+
+This is common on Ubuntu 23.10+/24.04 and some Fedora/Debian setups. Pick ONE
+fix below (each persists across reboots), then re-run: ekoloko
+
+  Ubuntu 23.10+ / 24.04 (AppArmor restriction):
+    echo 'kernel.apparmor_restrict_unprivileged_userns=0' | \
+      sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system
+
+  Debian / older kernels (userns disabled):
+    echo 'kernel.unprivileged_userns_clone=1' | \
+      sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system
+
+  Fedora / RHEL (namespaces capped at 0):
+    echo 'user.max_user_namespaces=15000' | \
+      sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system
+
+  Or make bubblewrap setuid-root (works everywhere, one-time root):
+    sudo chmod u+s "$(command -v bwrap)"
+
+  Or install firejail (used automatically if present):
+    sudo apt install firejail   # or dnf/pacman/zypper
+
+To run right now WITHOUT the sandbox (LESS SECURE: the app runs unconfined
+with your account's full access):
+    EKOLOKO_NO_JAIL=1 ekoloko
+MSG
+}
+
 # Main dispatcher
 if [ "${EKOLOKO_NO_JAIL:-0}" = "1" ]; then
     exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
-elif command -v bwrap >/dev/null 2>&1; then
+elif command -v bwrap >/dev/null 2>&1 && bwrap_works; then
     run_bwrap "$@"
 elif command -v firejail >/dev/null 2>&1; then
+    # bwrap missing or userns blocked; firejail is setuid so it still works.
     run_firejail "$@"
+elif command -v bwrap >/dev/null 2>&1; then
+    # bwrap present but user namespaces are blocked, and no firejail fallback.
+    # Don't silently drop confinement: guide the user to a real fix.
+    userns_help
+    exit 1
 else
     echo "ekoloko: no sandbox (bwrap/firejail) found; running unconfined." >&2
     exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
