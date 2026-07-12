@@ -63,12 +63,16 @@ The app runs in a sandbox with a throwaway home at:
 EOF
 }
 
+# Timeouts and retries: the GitHub API sometimes hangs and release downloads
+# stall on slow links; without limits the installer just sits there. A stall
+# (under 1 byte/s for 30s) aborts and retries, resuming (-C -) rather than
+# restarting. No overall time cap on the big download, only on API calls.
 if command -v curl >/dev/null 2>&1; then
-    fetch()      { curl -fL --progress-bar -o "$1" "$2"; }
-    fetch_text() { curl -fsL "$1"; }
+    fetch()      { curl -fL --progress-bar --connect-timeout 15 --speed-limit 1 --speed-time 30 --retry 3 --retry-delay 2 -C - -o "$1" "$2"; }
+    fetch_text() { curl -fsL --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 2 "$1"; }
 elif command -v wget >/dev/null 2>&1; then
-    fetch()      { wget -q --show-progress -O "$1" "$2"; }
-    fetch_text() { wget -qO- "$1"; }
+    fetch()      { wget -q --show-progress --timeout=30 --tries=3 --continue -O "$1" "$2"; }
+    fetch_text() { wget -qO- --timeout=30 --tries=3 "$1"; }
 else
     die "Need curl or wget installed."
 fi
