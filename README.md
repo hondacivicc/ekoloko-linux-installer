@@ -29,9 +29,45 @@ Everything lives under `~/.local/share/ekoloko` (the app plus its sandbox home),
 `~/.local/bin/ekoloko` for the launcher, and one `.desktop` file. Uninstall
 takes all of it out.
 
-You need bash and curl or wget, plus bubblewrap for the sandbox. The script
-installs bubblewrap for you if it's missing, or falls back to firejail. No root,
-no FUSE. Tested on Arch and Kali, but it doesn't use anything distro-specific.
+No root for the app itself, no FUSE. Tested on Arch, Kali and Ubuntu.
+
+## requirements
+
+To fetch and sandbox the app you need `bash` and `curl` or `wget`, plus
+`bubblewrap` (the script installs it for you if it's missing, or falls back to
+`firejail`).
+
+The app itself is Electron/Chromium, and the sandbox runs it against your
+system's libraries, so those need to be installed on the host. On a minimal
+install they usually aren't. Grab them all at once:
+
+**Debian / Ubuntu / Kali**
+
+```bash
+sudo apt install libxss1 libnss3 libnspr4 libgbm1 libasound2 libgtk-3-0 \
+  libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 libxkbcommon0 \
+  libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxtst6 libpangocairo-1.0-0
+```
+
+Don't reach for `apt install chromium` to get these — on Ubuntu it's a snap and
+installs no system libraries.
+
+**Fedora / RHEL**
+
+```bash
+sudo dnf install nss atk at-spi2-atk gtk3 libXScrnSaver libXtst \
+  alsa-lib mesa-libgbm cups-libs libxkbcommon libXcomposite libXrandr
+```
+
+**Arch**
+
+```bash
+sudo pacman -S --needed nss atk at-spi2-atk gtk3 libxss libxtst \
+  alsa-lib mesa libxkbcommon libxcomposite libxrandr
+```
+
+The installer runs `ldd` after downloading and prints exactly which libraries
+are missing, so if it launches clean you don't need any of this.
 
 ## why the sandbox
 
@@ -68,6 +104,30 @@ Upstream could kill bugs 1 and 2 with two lines in `main.js`:
 - `if (process.platform === "linux") app.commandLine.appendSwitch("no-sandbox")`
 
 If something breaks, the logs are at `~/.config/ekoloko-rewritten/logs/ekoloko.log`.
+
+## troubleshooting
+
+**`bwrap: setting up uid map: Permission denied`** — your system blocks
+unprivileged user namespaces (common on Ubuntu 23.10+ and some Fedora/Debian).
+Enable them, then re-run `ekoloko`:
+
+```bash
+# Ubuntu 23.10+ / 24.04
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system
+# Debian / older kernels
+echo 'kernel.unprivileged_userns_clone=1' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system
+# Fedora / RHEL
+echo 'user.max_user_namespaces=15000' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system
+```
+
+Or install `firejail` (used automatically if present), or `sudo chmod u+s "$(command -v bwrap)"`.
+
+**`error while loading shared libraries: ...cannot open shared object file`** —
+a system library is missing. Install the packages from [requirements](#requirements)
+above; the installer also lists the exact ones on its last line.
+
+**It starts but no window appears** — usually the same missing-library problem;
+check the log path above, and make sure the requirements are installed.
 
 ---
 
