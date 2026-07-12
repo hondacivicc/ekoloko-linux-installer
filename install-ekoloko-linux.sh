@@ -714,6 +714,195 @@ RT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 # Ensure app home exists; runtime dir is checked later
 mkdir -p "$HOME_JAIL"
 
+# Discover the configured keyboard layout(s) for spawn_layout_mirror: which
+# layouts to mirror while the game runs and what full keymap to restore
+# afterwards. Sources, best first:
+#   1. XKB_DEFAULT_* already exported (KDE/GNOME/sway commonly set these)
+#   2. Hyprland: hyprctl getoption input:kb_*  (authoritative multi-group cfg)
+#   3. X11: setxkbmap -query
+# Prints zero or more KEY=VALUE lines on stdout.
+collect_xkb_env() {
+    local layout="${XKB_DEFAULT_LAYOUT:-}" variant="${XKB_DEFAULT_VARIANT:-}" \
+          model="${XKB_DEFAULT_MODEL:-}" options="${XKB_DEFAULT_OPTIONS:-}" v pair
+
+    if [ -z "$layout" ] && command -v hyprctl >/dev/null 2>&1; then
+        # Hyprland uses "[[EMPTY]]" as the unset sentinel; treat it as blank.
+        for pair in kb_layout:layout kb_variant:variant kb_model:model \
+                    kb_options:options; do
+            v=$(hyprctl getoption -j "input:${pair%%:*}" 2>/dev/null \
+                | sed -n 's/.*"str": *"\([^"]*\)".*/\1/p')
+            [ -n "$v" ] && [ "$v" != "[[EMPTY]]" ] && printf -v "${pair#*:}" '%s' "$v"
+        done
+    fi
+
+    if [ -z "$layout" ] && [ -n "${DISPLAY:-}" ] && command -v setxkbmap >/dev/null 2>&1; then
+        local q; q=$(setxkbmap -query 2>/dev/null)
+        layout=$(printf '%s\n' "$q"  | sed -n 's/^layout:[[:space:]]*//p')
+        [ -z "$variant" ] && variant=$(printf '%s\n' "$q" | sed -n 's/^variant:[[:space:]]*//p')
+        [ -z "$model" ]   && model=$(printf '%s\n' "$q"   | sed -n 's/^model:[[:space:]]*//p')
+        [ -z "$options" ] && options=$(printf '%s\n' "$q" | sed -n 's/^options:[[:space:]]*//p')
+    fi
+
+    [ -n "$layout" ]  && printf 'XKB_DEFAULT_LAYOUT=%s\n'  "$layout"
+    [ -n "$variant" ] && printf 'XKB_DEFAULT_VARIANT=%s\n' "$variant"
+    [ -n "$model" ]   && printf 'XKB_DEFAULT_MODEL=%s\n'   "$model"
+    [ -n "$options" ] && printf 'XKB_DEFAULT_OPTIONS=%s\n' "$options"
+}
+
+# The client's Electron 8 (Chromium 80) reads X11 keys via XInput2, whose
+# modifier state carries no XKB group, so switching layouts by group — how
+# every compositor exposes a second layout (Hebrew, Arabic, Cyrillic, ...) to
+# X11 apps — never reaches it: the app translates every key with group 1 and
+# you can only ever type the first layout. Verified against Xwayland: the
+# server's group flips, the app keeps typing English. What old Chromium DOES
+# honor is a whole-keymap change. So while the game runs, mirror the
+# compositor's active layout into the X server as a single-layout keymap on
+# every switch, and restore the real multi-layout keymap when the game exits.
+# Hyprland-only for now (its IPC socket broadcasts layout changes); elsewhere
+# this is a silent no-op. The watcher lives outside the sandbox and keys off
+# our PID, which exec hands to the app/bwrap, so it dies with the game.
+spawn_layout_mirror() {
+    [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] || return 0
+    [ -n "${DISPLAY:-}" ] || return 0
+    command -v setxkbmap >/dev/null 2>&1 || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local layout='' variant='' model='' options='' line
+    while IFS= read -r line; do
+        case "$line" in
+            XKB_DEFAULT_LAYOUT=*)  layout=${line#*=} ;;
+            XKB_DEFAULT_VARIANT=*) variant=${line#*=} ;;
+            XKB_DEFAULT_MODEL=*)   model=${line#*=} ;;
+            XKB_DEFAULT_OPTIONS=*) options=${line#*=} ;;
+        esac
+    done < <(collect_xkb_env)
+    # With a single layout there is no group switching to paper over.
+    case "$layout" in *,*) ;; *) return 0 ;; esac
+    python3 - "$$" "$layout" "$variant" "$model" "$options" "$DISPLAY" <<'PYEOF' >/dev/null 2>&1 &
+import json, os, signal, socket, subprocess, sys
+
+pid = int(sys.argv[1])
+layouts = sys.argv[2].split(',')
+variants = sys.argv[3].split(',') if sys.argv[3] else []
+variants += [''] * (len(layouts) - len(variants))
+model, options, display = sys.argv[4], sys.argv[5], sys.argv[6]
+
+def xkb(args):
+    cmd = ['setxkbmap', '-display', display] + args
+    if model:
+        cmd += ['-model', model]
+    cmd += ['-option', '']  # clear, then re-apply, so stale options never pile up
+    if options:
+        cmd += ['-option', options]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def set_single(i):
+    args = ['-layout', layouts[i]]
+    if variants[i]:
+        args += ['-variant', variants[i]]
+    xkb(args)
+
+def restore():
+    args = ['-layout', ','.join(layouts)]
+    if any(variants):
+        args += ['-variant', ','.join(variants)]
+    xkb(args)
+
+# Hyprland reports layouts by description ("Hebrew"), our config holds codes
+# ("il"); the xkb rules registry maps between them.
+def build_desc_index():
+    idx = {}
+    for lst in ('/usr/share/X11/xkb/rules/evdev.lst',
+                '/usr/share/X11/xkb/rules/base.lst'):
+        try:
+            with open(lst, errors='replace') as f:
+                sec = None
+                for raw in f:
+                    if raw.startswith('!'):
+                        parts = raw.split()
+                        sec = parts[1] if len(parts) > 1 else None
+                        continue
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    if sec == 'layout':
+                        code, _, desc = line.partition(' ')
+                        for i, (lay, var) in enumerate(zip(layouts, variants)):
+                            if code == lay and not var:
+                                idx.setdefault(desc.strip(), i)
+                    elif sec == 'variant':
+                        head, _, desc = line.partition(':')
+                        parts = head.split()
+                        if len(parts) == 2:
+                            vcode, vlay = parts
+                            for i, (lay, var) in enumerate(zip(layouts, variants)):
+                                if vlay == lay and vcode == var:
+                                    idx.setdefault(desc.strip(), i)
+            if idx:
+                return idx
+        except OSError:
+            pass
+    return idx
+
+desc_index = build_desc_index()
+
+def apply(desc):
+    i = desc_index.get(desc)
+    if i is not None:
+        set_single(i)
+
+def current_desc():
+    try:
+        out = subprocess.run(['hyprctl', '-j', 'devices'], capture_output=True,
+                             text=True, timeout=5).stdout
+        kbs = json.loads(out).get('keyboards', [])
+        for k in kbs:
+            if k.get('main'):
+                return k.get('active_keymap', '')
+        return kbs[0].get('active_keymap', '') if kbs else ''
+    except Exception:
+        return ''
+
+def alive():
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+apply(current_desc())
+try:
+    sock = os.path.join(os.environ.get('XDG_RUNTIME_DIR', '/tmp'), 'hypr',
+                        os.environ['HYPRLAND_INSTANCE_SIGNATURE'], '.socket2.sock')
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock)
+    s.settimeout(1.0)
+    buf = b''
+    while alive():
+        try:
+            data = s.recv(4096)
+        except socket.timeout:
+            continue
+        if not data:
+            break
+        buf += data
+        while b'\n' in buf:
+            ln, buf = buf.split(b'\n', 1)
+            if ln.startswith(b'activelayout>>'):
+                apply(ln.decode(errors='replace').split('>>', 1)[1].split(',', 1)[1])
+    # Hyprland's socket closed but the game is still up: poll instead.
+    last = None
+    while alive():
+        import time; time.sleep(0.5)
+        desc = current_desc()
+        if desc and desc != last:
+            last = desc
+            apply(desc)
+finally:
+    restore()
+PYEOF
+}
+
 run_bwrap() {
     local -a a=(
         --die-with-parent
@@ -843,6 +1032,8 @@ run_bwrap() {
         echo "Warning: X11 session with a trusted cookie; the app can observe and inject input into other windows." >&2
     fi
 
+    spawn_layout_mirror
+
     # fd 8/9 feed --ro-bind-data: a two-user passwd/group so the app can
     # resolve its own uid without seeing the host's account list.
     exec bwrap "${a[@]}" "$HOME/app/$BIN_NAME" --no-sandbox "$@" \
@@ -858,6 +1049,7 @@ run_firejail() {
     # --read-only keeps the app's own code immutable from inside the jail,
     # matching the bwrap setup: a compromised game can't trojan the binary
     # that future launches execute.
+    spawn_layout_mirror
     exec firejail --quiet --noprofile \
         --private="$HOME_JAIL" --private-tmp \
         --read-only="$HOME/app" \
@@ -960,6 +1152,7 @@ Continue = play without the sandbox." 2>/dev/null
 
 # Main dispatcher
 if [ "${EKOLOKO_NO_JAIL:-0}" = "1" ]; then
+    spawn_layout_mirror
     exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
 elif command -v bwrap >/dev/null 2>&1 && bwrap_works; then
     run_bwrap "$@"
@@ -972,11 +1165,13 @@ elif command -v bwrap >/dev/null 2>&1; then
     # play unconfined this once.
     have_tty && userns_help
     if confirm_unconfined "The sandbox can't start: your system blocks unprivileged user namespaces. See the README's troubleshooting for the permanent fix, or install firejail."; then
+        spawn_layout_mirror
         exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
     fi
     exit 1
 else
     if confirm_unconfined "No sandbox is installed (bubblewrap or firejail). Install one so the game runs confined."; then
+        spawn_layout_mirror
         exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
     fi
     exit 1

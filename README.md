@@ -135,6 +135,11 @@ echo 'user.max_user_namespaces=15000' | sudo tee /etc/sysctl.d/60-userns.conf &&
 
 Or install `firejail` (used automatically if present), or `sudo chmod u+s "$(command -v bwrap)"`.
 
+**Can't type your second keyboard layout (Hebrew, Russian, ...) in chat** —
+the client's old Chromium ignores XKB group switching, so only the first
+layout ever types. On Hyprland the launcher works around this automatically
+(needs `setxkbmap` and `python3`); on other compositors it's still broken.
+
 **`error while loading shared libraries: ...cannot open shared object file`** —
 a system library is missing. Install the packages from [requirements](#requirements)
 above; the installer also lists the exact ones on its last line.
