@@ -343,10 +343,6 @@ run_bwrap() {
         --unshare-all --share-net
         --clearenv
         --ro-bind /usr /usr
-        --ro-bind-try /lib64 /lib64
-        --symlink usr/lib /lib
-        --symlink usr/bin /bin
-        --symlink usr/bin /sbin
         --ro-bind-try /etc/ssl /etc/ssl
         --ro-bind-try /etc/pki /etc/pki
         --ro-bind-try /etc/ca-certificates /etc/ca-certificates
@@ -366,6 +362,20 @@ run_bwrap() {
         --tmpfs /tmp
         --tmpfs /dev/shm
     )
+
+    # Recreate the host's /lib, /bin, etc. exactly as they are, rather than
+    # assuming one distro's layout. Merged-/usr systems (Arch, modern Debian/
+    # Ubuntu/Kali/Fedora) make these symlinks into /usr; older systems keep
+    # them as real dirs holding the loader and core libs. Hardcoding Arch's
+    # shape put ld-linux and the multiarch libs in the wrong place on Debian
+    # family, so the app's binary couldn't start and exited with no window.
+    for d in /lib /lib64 /lib32 /libx32 /bin /sbin; do
+        if [ -L "$d" ]; then
+            a+=( --symlink "$(readlink "$d")" "$d" )
+        elif [ -d "$d" ]; then
+            a+=( --ro-bind "$d" "$d" )
+        fi
+    done
 
     # GPU access (DRI)
     [ -d /dev/dri ] && a+=( --dev-bind-try /dev/dri /dev/dri )
