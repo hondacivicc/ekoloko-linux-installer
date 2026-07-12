@@ -331,9 +331,10 @@ check_runtime_libs() {
     warn "The sandbox uses your system's libraries, so install them on the host:"
 
     if command -v apt-get >/dev/null 2>&1; then
-        warn "  sudo apt install libxss1 libnss3 libnspr4 libgbm1 libasound2 libgtk-3-0 \\"
+        warn "  sudo apt install libxss1 libnss3 libnspr4 libgbm1 libasound2t64 libgtk-3-0 \\"
         warn "    libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 libxkbcommon0 \\"
         warn "    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxtst6 libpangocairo-1.0-0"
+        warn "  (on Ubuntu 22.04/Debian use libasound2 instead of libasound2t64)"
         warn "  (heads up: 'apt install chromium' on Ubuntu is a snap and installs no libraries)"
     elif command -v dnf >/dev/null 2>&1; then
         warn "  sudo dnf install nss atk at-spi2-atk gtk3 libXScrnSaver libXtst \\"

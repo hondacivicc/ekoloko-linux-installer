@@ -44,10 +44,13 @@ install they usually aren't. Grab them all at once:
 **Debian / Ubuntu / Kali**
 
 ```bash
-sudo apt install libxss1 libnss3 libnspr4 libgbm1 libasound2 libgtk-3-0 \
+sudo apt install libxss1 libnss3 libnspr4 libgbm1 libasound2t64 libgtk-3-0 \
   libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 libxkbcommon0 \
   libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxtst6 libpangocairo-1.0-0
 ```
+
+On Ubuntu 22.04 and Debian, use `libasound2` instead of `libasound2t64` (the
+`t64` name is the 24.04 time_t transition). apt remaps the other names for you.
 
 Don't reach for `apt install chromium` to get these — on Ubuntu it's a snap and
 installs no system libraries.
