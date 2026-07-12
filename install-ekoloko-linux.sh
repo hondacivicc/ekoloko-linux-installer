@@ -308,6 +308,48 @@ mkdir -p "$HOME_JAIL"
 mv "$TMP/squashfs-root" "$APP"
 ok "Installed to $APP"
 
+# --- check runtime libraries
+#
+# The sandbox binds the host's /usr, so any library the app needs but the
+# system doesn't have shows up as a crash on launch ("cannot open shared
+# object file"). Catch them all now with ldd instead of one at a time. On
+# Ubuntu note that `apt install chromium` is a snap and installs no libs.
+
+check_runtime_libs() {
+    command -v ldd >/dev/null 2>&1 || return 0
+
+    local missing
+    missing=$(ldd "$APP/$BIN_NAME" 2>/dev/null | awk '/not found/ {print $1}' | sort -u || true)
+
+    if [ -z "$missing" ]; then
+        ok "Runtime libraries: all present."
+        return 0
+    fi
+
+    warn "The app needs these system libraries, which aren't installed:"
+    printf '       %s\n' $missing >&2
+    warn "The sandbox uses your system's libraries, so install them on the host:"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        warn "  sudo apt install libxss1 libnss3 libnspr4 libgbm1 libasound2 libgtk-3-0 \\"
+        warn "    libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 libxkbcommon0 \\"
+        warn "    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxtst6 libpangocairo-1.0-0"
+        warn "  (heads up: 'apt install chromium' on Ubuntu is a snap and installs no libraries)"
+    elif command -v dnf >/dev/null 2>&1; then
+        warn "  sudo dnf install nss atk at-spi2-atk gtk3 libXScrnSaver libXtst \\"
+        warn "    alsa-lib mesa-libgbm cups-libs libxkbcommon libXcomposite libXrandr"
+    elif command -v pacman >/dev/null 2>&1; then
+        warn "  sudo pacman -S --needed nss atk at-spi2-atk gtk3 libxss libxtst \\"
+        warn "    alsa-lib mesa libxkbcommon libxcomposite libxrandr"
+    elif command -v zypper >/dev/null 2>&1; then
+        warn "  sudo zypper install libXss1 mozilla-nss libgtk-3-0 at-spi2-atk libXtst6 \\"
+        warn "    libasound2 libgbm1 cups-libs libxkbcommon0"
+    else
+        warn "  Install the package that provides each library listed above."
+    fi
+}
+check_runtime_libs
+
 # --- write launcher
 
 mkdir -p "$BIN_DIR"
