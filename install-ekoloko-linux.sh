@@ -105,7 +105,8 @@ fi
 # --- uninstall
 
 if [ $UNINSTALL -eq 1 ]; then
-    rm -f "$LAUNCHER" "$DESKTOP_DIR/ekoloko.desktop" "$ICON_PATH" 2>/dev/null || true
+    rm -f "$LAUNCHER" "$DESKTOP_DIR/ekoloko.desktop" "$ICON_PATH" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}"/icons/hicolor/*/apps/ekoloko.png 2>/dev/null || true
     if [ $PURGE -eq 1 ]; then
         rm -rf "$HOME_JAIL"
         ok "ekoloko removed completely."
@@ -973,12 +974,33 @@ chmod +x "$LAUNCHER"
 ok "Sandboxed launcher: $LAUNCHER"
 
 # --- desktop entry + icon
+#
+# GNOME resolves icons most reliably by theme name, so install the PNG into
+# the hicolor theme at its real size (the AppImage ships it under a useless
+# "0x0" directory) and reference it as "ekoloko". A copy at the flat legacy
+# path stays as a fallback for lookups outside the theme. StartupWMClass ties
+# the running window (WM_CLASS = the binary name) to this desktop entry;
+# without it GNOME's dock shows a generic icon for the running app.
 
 mkdir -p "$DESKTOP_DIR" "$(dirname "$ICON_PATH")"
 
-ICON_SRC=$(find "$APP" -maxdepth 1 -name "*.png" 2>/dev/null | head -1 || true)
+ICON_SRC=$(find "$APP/usr/share/icons" "$APP" -maxdepth 4 -name "*.png" -type f 2>/dev/null | head -1 || true)
+ICON_REF="$ICON_PATH"
 if [ -n "$ICON_SRC" ]; then
-    cp "$ICON_SRC" "$ICON_PATH"
+    cp -f "$ICON_SRC" "$ICON_PATH"
+    ICON_SIZE=""
+    if command -v file >/dev/null 2>&1; then
+        ICON_SIZE=$(file "$ICON_SRC" | grep -oE '[0-9]+ x [0-9]+' | head -1 | awk '{print $1}')
+    fi
+    if [ -n "$ICON_SIZE" ]; then
+        THEME_APPS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/${ICON_SIZE}x${ICON_SIZE}/apps"
+        mkdir -p "$THEME_APPS"
+        cp -f "$ICON_SRC" "$THEME_APPS/ekoloko.png"
+        ICON_REF="ekoloko"
+        if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -q "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
+        fi
+    fi
 fi
 
 cat > "$DESKTOP_DIR/ekoloko.desktop" <<EOF
@@ -987,7 +1009,8 @@ Type=Application
 Name=Ekoloko
 Comment=ekoloko desktop client (sandboxed), play.ekoloko.org
 Exec=$LAUNCHER
-Icon=$ICON_PATH
+Icon=$ICON_REF
+StartupWMClass=$BIN_NAME
 Categories=Game;
 Terminal=false
 EOF
@@ -1045,9 +1068,15 @@ echo ""
 echo "Sandbox:    $HOME_JAIL"
 echo "            (app can only see this, not your real home)"
 echo ""
+# When run via 'curl | bash', $0 is just "bash"; show a usable command.
+SELF="$0"
+case "$(basename "$SELF")" in
+    bash|sh|dash|zsh) SELF="./install-ekoloko-linux.sh" ;;
+esac
+
 echo "Update:     re-run this script"
-echo "Uninstall:  $0 --uninstall"
-echo "Purge:      $0 --purge"
+echo "Uninstall:  $SELF --uninstall"
+echo "Purge:      $SELF --purge"
 echo ""
 echo "Skip jail:  EKOLOKO_NO_JAIL=1 ekoloko"
 echo ""
