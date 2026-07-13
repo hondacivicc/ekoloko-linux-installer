@@ -266,7 +266,7 @@ ensure_sandbox() {
             offer_userns_fix
         fi
     else
-        warn "Couldn't install a sandbox. The app will run without confinement, so any exploit has full account access. Install bubblewrap and re-run."
+        warn "Couldn't install a sandbox. Without it the app isn't secure. Install bubblewrap and re-run."
     fi
 }
 ensure_sandbox
@@ -411,14 +411,14 @@ extract_bwrap() {
     bwrap "${a[@]}" -- /work/app.AppImage --appimage-extract >/dev/null 2>&1
 }
 
-info "Extracting AppImage (without running it on the host)"
+info "Extracting AppImage"
 if command -v unsquashfs >/dev/null 2>&1 && extract_unsquashfs; then
     ok "Extracted with unsquashfs."
 elif rm -rf "$TMP/squashfs-root" && extract_bwrap; then
     ok "Extracted inside the bubblewrap sandbox."
 else
     rm -rf "$TMP/squashfs-root"
-    die "Can't extract the AppImage safely: extraction executes code from the download, so it only happens via unsquashfs or inside the bubblewrap sandbox. Install squashfs-tools (unsquashfs), or a working bubblewrap, and re-run."
+    die "Can't extract the AppImage without unsquashfs or a working bubblewrap. Install squashfs-tools (unsquashfs), or a working bubblewrap, and re-run."
 fi
 [ -d "$TMP/squashfs-root" ] || die "Extracted directory not found; AppImage may be corrupt."
 
@@ -1087,7 +1087,7 @@ run_bwrap() {
 
     # X11 access warning (only when the trusted cookie is in use)
     if [ -n "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ "$x_untrusted" -eq 0 ]; then
-        echo "Warning: X11 session with a trusted cookie; the app can observe and inject input into other windows." >&2
+        echo "Warning: the game isn't fully isolated on this X11 session." >&2
     fi
 
     # Reduce kernel attack surface for the --no-sandbox Chromium with a seccomp
@@ -1142,8 +1142,8 @@ fix below (each persists across reboots), then re-run: ekoloko
   Or make bubblewrap setuid-root (works everywhere, one-time root):
     sudo chmod u+s "$(command -v bwrap)"
 
-To skip the sandbox permanently (LESS SECURE: the app runs unconfined
-with your account's full access):
+To skip the sandbox permanently (not secure -- the app runs with your
+account's normal access):
     EKOLOKO_NO_JAIL=1 ekoloko
 MSG
 }
@@ -1165,14 +1165,14 @@ confirm_unconfined() {
     local msg="$1" q reply=""
     if have_tty; then
         printf '%s\n' "$msg" > /dev/tty
-        printf 'Play anyway WITHOUT the sandbox (full access to your files)? [y/N] ' > /dev/tty
+        printf 'Play anyway WITHOUT the sandbox (not secure)? [y/N] ' > /dev/tty
         IFS= read -r reply < /dev/tty || true
         case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; esac
         return 1
     fi
     q="$msg
 
-Without the sandbox the game runs with your account's full access."
+Without the sandbox the game isn't secure."
     if command -v zenity >/dev/null 2>&1; then
         zenity --question --default-cancel --title="ekoloko" \
             --ok-label="Play anyway" --cancel-label="Don't play" \

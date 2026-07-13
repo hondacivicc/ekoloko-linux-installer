@@ -71,27 +71,19 @@ are missing, so if it launches clean you don't need any of this.
 ## why the sandbox
 
 The client bundles an old Flash and an old Chromium, and it has to run with
-`--no-sandbox` for Flash to load at all. That's fine for a single trusted site,
-but a bug in Flash or the renderer would run code as your user, with access to
-your home dir, ssh keys and so on.
+`--no-sandbox` for Flash to load at all. Run that way it isn't secure, so the
+launcher wraps it in bubblewrap. Inside the jail the app only sees a throwaway
+home (`~/.local/share/ekoloko`) instead of your real one, a read-only system,
+and just the sockets it needs for graphics and sound. Nothing else from your
+account is exposed.
 
-So the launcher wraps it in bubblewrap. Inside the jail the app only sees a
-throwaway home (`~/.local/share/ekoloko`) instead of your real one. It gets a
-read-only system, network access, and just the sockets it needs for graphics
-and sound. Nothing else from your account is mounted.
+For the same reason it runs through Xwayland with the native Wayland socket
+withheld, and doesn't bind the GPU (it renders in software anyway) — passing
+those in would be less secure. Set `EKOLOKO_WAYLAND=1` or `EKOLOKO_GPU=1` to
+enable them if you need to.
 
-The sandbox limits filesystem and process access, but not network egress, which
-is unrestricted. Because a bound Wayland socket on wlroots compositors (Hyprland,
-sway) lets any client screenshot, inject input and read the clipboard, the
-launcher runs the app through Xwayland and withholds the Wayland socket, then
-blocks the equivalent X11 tricks with an untrusted cookie. Set `EKOLOKO_WAYLAND=1`
-to pass the native Wayland socket through instead.
-
-The GPU devices aren't bound either — the app renders in software (SwiftShader)
-anyway — so a renderer exploit can't reach the GPU kernel drivers. Set
-`EKOLOKO_GPU=1` to bind them back for hardware acceleration.
-
-If you ever need to run it without the sandbox: `EKOLOKO_NO_JAIL=1 ekoloko`.
+If you ever need to run it without the sandbox: `EKOLOKO_NO_JAIL=1 ekoloko` (not
+secure — the app runs with your account's normal access).
 
 If no working sandbox is available at launch (bwrap blocked or not installed),
 the launcher never drops confinement silently: it
