@@ -147,6 +147,10 @@ above; the installer also lists the exact ones on its last line.
 **It starts but no window appears** — usually the same missing-library problem;
 check the log path above, and make sure the requirements are installed.
 
+**Audio artifact plays for a few seconds after logging in** — a sound effect or
+background audio starts briefly after login and entering the game (usually clears
+itself).
+
 ---
 
 Not affiliated with ekoloko.org. This just downloads the official client from
