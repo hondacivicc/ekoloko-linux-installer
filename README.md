@@ -8,11 +8,7 @@ around them.
 
 ## install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/hondacivicc/ekoloko-linux-installer/master/install-ekoloko-linux.sh | bash
-```
-
-or clone and run it:
+Clone it (so you can read the script first), then run it:
 
 ```bash
 git clone https://github.com/hondacivicc/ekoloko-linux-installer
@@ -37,8 +33,7 @@ No root for the app itself, no FUSE. Tested on Arch, Kali and Ubuntu.
 ## requirements
 
 To fetch and sandbox the app you need `bash` and `curl` or `wget`, plus
-`bubblewrap` (the script installs it for you if it's missing, or falls back to
-`firejail`).
+`bubblewrap` (the script installs it for you if it's missing).
 
 The app itself is Electron/Chromium, and the sandbox runs it against your
 system's libraries, so those need to be installed on the host. On a minimal
@@ -82,13 +77,24 @@ your home dir, ssh keys and so on.
 
 So the launcher wraps it in bubblewrap. Inside the jail the app only sees a
 throwaway home (`~/.local/share/ekoloko`) instead of your real one. It gets a
-read-only system, network access for play.ekoloko.org, and just the sockets it
-needs for graphics and sound. Nothing else from your account is mounted.
+read-only system, network access, and just the sockets it needs for graphics
+and sound. Nothing else from your account is mounted.
+
+The sandbox limits filesystem and process access, but not network egress, which
+is unrestricted. Because a bound Wayland socket on wlroots compositors (Hyprland,
+sway) lets any client screenshot, inject input and read the clipboard, the
+launcher runs the app through Xwayland and withholds the Wayland socket, then
+blocks the equivalent X11 tricks with an untrusted cookie. Set `EKOLOKO_WAYLAND=1`
+to pass the native Wayland socket through instead.
+
+The GPU devices aren't bound either — the app renders in software (SwiftShader)
+anyway — so a renderer exploit can't reach the GPU kernel drivers. Set
+`EKOLOKO_GPU=1` to bind them back for hardware acceleration.
 
 If you ever need to run it without the sandbox: `EKOLOKO_NO_JAIL=1 ekoloko`.
 
-If no working sandbox is available at launch (bwrap blocked, or neither bwrap
-nor firejail installed), the launcher never drops confinement silently: it
+If no working sandbox is available at launch (bwrap blocked or not installed),
+the launcher never drops confinement silently: it
 asks first. From a terminal that's a y/N prompt; from the desktop icon it's a
 popup (zenity, kdialog, yad or xmessage — whichever the system has). If it has
 no way to ask, it refuses to start and sends a desktop notification saying why.
@@ -133,7 +139,7 @@ echo 'kernel.unprivileged_userns_clone=1' | sudo tee /etc/sysctl.d/60-userns.con
 echo 'user.max_user_namespaces=15000' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system
 ```
 
-Or install `firejail` (used automatically if present), or `sudo chmod u+s "$(command -v bwrap)"`.
+Or make bwrap setuid-root: `sudo chmod u+s "$(command -v bwrap)"`.
 
 **Can't type your second keyboard layout (Hebrew, Russian, ...) in chat** —
 the client's old Chromium ignores XKB group switching, so only the first

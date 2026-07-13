@@ -13,9 +13,8 @@
 #
 # about the sandbox: the client bundles old Flash and old Chromium and
 # runs with --no-sandbox for Flash to load, so a bug runs as your user.
-# The launcher wraps it in bubblewrap (or firejail) with a throwaway home
-# instead of your real one. If neither tool is installed it still runs,
-# just with a warning.
+# The launcher wraps it in bubblewrap with a throwaway home instead of your
+# real one. If bubblewrap isn't installed it still runs, just with a warning.
 #
 # needs bash, curl or wget. no root needed for the app itself.
 
@@ -60,6 +59,10 @@ Usage:
 
 Environment:
   EKOLOKO_NO_JAIL=1     Run the app unconfined (skip sandbox)
+  EKOLOKO_WAYLAND=1     Pass the native Wayland socket into the sandbox
+                        (default: run via Xwayland, socket withheld)
+  EKOLOKO_GPU=1         Bind GPU devices (/dev/dri, /dev/nvidia*) into the
+                        sandbox (default: software rendering, no GPU access)
   XDG_DATA_HOME         Override ~/.local/share
   XDG_BIN_HOME          Override ~/.local/bin
 
@@ -104,9 +107,29 @@ fi
 
 # --- uninstall
 
+# Remove the PATH line the installer appended to a shell rc (exact match only,
+# so the user's own edits are left alone). Mirrors add_to_path further down.
+remove_from_path() {
+    local shell_rc="$1" bin_dir="$2" line tmp
+    [ -f "$shell_rc" ] || return 0
+    line="export PATH=\"$bin_dir:\$PATH\""
+    grep -Fqx "$line" "$shell_rc" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    grep -Fvx "$line" "$shell_rc" > "$tmp" 2>/dev/null && cat "$tmp" > "$shell_rc"
+    rm -f "$tmp"
+}
+
 if [ $UNINSTALL -eq 1 ]; then
     rm -f "$LAUNCHER" "$DESKTOP_DIR/ekoloko.desktop" "$ICON_PATH" \
         "${XDG_DATA_HOME:-$HOME/.local/share}"/icons/hicolor/*/apps/ekoloko.png 2>/dev/null || true
+
+    # Undo the PATH changes install made (bash/zsh rc lines + fish universal var).
+    remove_from_path "$HOME/.bashrc" "$BIN_DIR"
+    remove_from_path "$HOME/.zshrc" "$BIN_DIR"
+    if command -v fish >/dev/null 2>&1; then
+        fish -c "set -q fish_user_paths; and set -U fish_user_paths (string match -v -- '$BIN_DIR' \$fish_user_paths)" 2>/dev/null || true
+    fi
+
     if [ $PURGE -eq 1 ]; then
         rm -rf "$HOME_JAIL"
         ok "ekoloko removed completely."
@@ -156,12 +179,12 @@ offer_userns_fix() {
     warn "(common on Ubuntu 23.10+/24.04 and some Fedora/Debian setups)."
 
     if [ -z "$setting" ]; then
-        warn "See the README's troubleshooting section for the fix, or install firejail."
+        warn "See the README's troubleshooting section for the fix (sysctl or setuid bwrap)."
         return 0
     fi
 
     warn "The fix writes '$setting' to /etc/sysctl.d/60-userns.conf"
-    warn "(persists across reboots, needs sudo). You can also skip it and use firejail."
+    warn "(persists across reboots, needs sudo). You can also make bwrap setuid instead."
 
     # Ask on the terminal itself so this also works via 'curl | bash'.
     if ! { read -r -p "Apply the fix now? [y/N] " reply < /dev/tty; } 2>/dev/null; then
@@ -187,7 +210,7 @@ offer_userns_fix() {
         *)
             warn "Skipped. Apply it later with:"
             warn "  echo '$setting' | sudo tee /etc/sysctl.d/60-userns.conf && sudo sysctl --system"
-            warn "(or install firejail; the launcher uses it automatically)"
+            warn '(or make bwrap setuid-root: sudo chmod u+s "$(command -v bwrap)")'
             ;;
     esac
 }
@@ -199,16 +222,8 @@ ensure_sandbox() {
         # Fedora/Debian): offer the sysctl fix right away rather than
         # letting the first launch fail.
         if ! bwrap --ro-bind / / --unshare-user -- /bin/true >/dev/null 2>&1; then
-            if command -v firejail >/dev/null 2>&1; then
-                warn "bubblewrap can't use user namespaces here; firejail will be used instead."
-            else
-                offer_userns_fix
-            fi
+            offer_userns_fix
         fi
-        return 0
-    fi
-    if command -v firejail >/dev/null 2>&1; then
-        ok "Sandbox: firejail"
         return 0
     fi
 
@@ -218,12 +233,12 @@ ensure_sandbox() {
     # ask on /dev/tty like the userns fix does. sudo prompts there anyway.
     local reply
     if ! { read -r -p "Install bubblewrap with sudo now? [Y/n] " reply < /dev/tty; } 2>/dev/null; then
-        warn "No terminal to ask on. Install bubblewrap or firejail manually and re-run."
+        warn "No terminal to ask on. Install bubblewrap manually and re-run."
         return 0
     fi
     case "$reply" in
         [nN]*)
-            warn "Skipped. Install bubblewrap or firejail manually and re-run."
+            warn "Skipped. Install bubblewrap manually and re-run."
             return 0
             ;;
     esac
@@ -251,7 +266,7 @@ ensure_sandbox() {
             offer_userns_fix
         fi
     else
-        warn "Couldn't install a sandbox. The app will run without confinement, so any exploit has full account access. Install bubblewrap or firejail and re-run."
+        warn "Couldn't install a sandbox. The app will run without confinement, so any exploit has full account access. Install bubblewrap and re-run."
     fi
 }
 ensure_sandbox
@@ -266,6 +281,11 @@ VERSION_FILE="$HOME_JAIL/.installed-release"
 SKIP_DOWNLOAD=0
 if [ -n "$PINNED_VERSION" ] && [ $SKIP_PIN -eq 0 ] && [ -f "$VERSION_FILE" ]; then
     read -r INST_VER INST_BIN < "$VERSION_FILE" || true
+    # $VERSION_FILE lives in the jail-writable home, so a compromised sandboxed
+    # app can rewrite it. INST_BIN must be a bare filename: a value like
+    # "../evil" would make the launcher exec $HOME/app/../evil, i.e. code the
+    # game dropped in its writable home (and unconfined under EKOLOKO_NO_JAIL=1).
+    case "${INST_BIN:-}" in */*) INST_BIN='' ;; esac
     if [ "${INST_VER:-}" = "$PINNED_VERSION" ] && [ -n "${INST_BIN:-}" ] && [ -x "$APP/$INST_BIN" ]; then
         BIN_NAME="$INST_BIN"
         SKIP_DOWNLOAD=1
@@ -346,7 +366,7 @@ fi
 # app later. A type-2 AppImage is an ELF stub with a squashfs image appended
 # right after the section headers, so read the image out with unsquashfs and
 # never execute anything. Where squashfs-tools isn't installed, fall back to
-# running --appimage-extract inside bubblewrap/firejail (no network, read-only
+# running --appimage-extract inside bubblewrap (no network, read-only
 # system, throwaway home). If neither is possible, stop rather than execute
 # an unverified download unconfined.
 
@@ -391,23 +411,14 @@ extract_bwrap() {
     bwrap "${a[@]}" -- /work/app.AppImage --appimage-extract >/dev/null 2>&1
 }
 
-extract_firejail() {
-    command -v firejail >/dev/null 2>&1 || return 1
-    firejail --quiet --noprofile --net=none --private="$TMP" --private-tmp \
-        --caps.drop=all --nonewprivs --noroot --seccomp --disable-mnt \
-        bash -c 'cd "$HOME" && ./app.AppImage --appimage-extract' >/dev/null 2>&1
-}
-
 info "Extracting AppImage (without running it on the host)"
 if command -v unsquashfs >/dev/null 2>&1 && extract_unsquashfs; then
     ok "Extracted with unsquashfs."
 elif rm -rf "$TMP/squashfs-root" && extract_bwrap; then
     ok "Extracted inside the bubblewrap sandbox."
-elif rm -rf "$TMP/squashfs-root" && extract_firejail; then
-    ok "Extracted inside the firejail sandbox."
 else
     rm -rf "$TMP/squashfs-root"
-    die "Can't extract the AppImage safely: extraction executes code from the download, so it only happens via unsquashfs or inside a sandbox. Install squashfs-tools (unsquashfs), or a working bubblewrap/firejail, and re-run."
+    die "Can't extract the AppImage safely: extraction executes code from the download, so it only happens via unsquashfs or inside the bubblewrap sandbox. Install squashfs-tools (unsquashfs), or a working bubblewrap, and re-run."
 fi
 [ -d "$TMP/squashfs-root" ] || die "Extracted directory not found; AppImage may be corrupt."
 
@@ -634,10 +645,6 @@ safe_ldd() {
             --ro-bind "$APP" "$APP" \
             --setenv PATH /usr/bin:/bin \
             -- ldd "$1" 2>/dev/null
-    elif command -v firejail >/dev/null 2>&1; then
-        firejail --quiet --noprofile --net=none --private-tmp \
-            --caps.drop=all --nonewprivs --noroot --seccomp \
-            --read-only="$HOME" ldd "$1" 2>/dev/null
     else
         return 1
     fi
@@ -691,7 +698,7 @@ mkdir -p "$BIN_DIR"
 
 cat > "$LAUNCHER" <<'LAUNCHER_EOF'
 #!/bin/bash
-# ekoloko launcher: runs the client in a bubblewrap or firejail sandbox.
+# ekoloko launcher: runs the client in a bubblewrap sandbox.
 # The app bundles old Flash and Chromium and requires --no-sandbox to run,
 # so this wrapper confines it with a throwaway home (not your real one).
 # Set EKOLOKO_NO_JAIL=1 to skip the sandbox.
@@ -903,6 +910,45 @@ finally:
 PYEOF
 }
 
+# Compile a small seccomp denylist and print it as a raw cBPF program (the
+# format bwrap's --seccomp reads). It blocks syscalls a --no-sandbox Chromium
+# never needs but a kernel exploit would want: namespace/mount setup, module
+# loading, kexec, raw I/O ports, the keyring, NUMA and swap control. Default
+# action is ALLOW, so normal operation is untouched. Pure python3 stdlib (no
+# libseccomp); x86_64 numbers only, which the installer already requires. If
+# python3 is missing this prints nothing and the launcher runs without seccomp.
+seccomp_filter() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - <<'SECEOF'
+import struct, sys
+def stmt(c, k):        return struct.pack("<HBBI", c, 0, 0, k)
+def jmp(c, k, jt, jf): return struct.pack("<HBBI", c, jt, jf, k)
+LD, W, ABS = 0x00, 0x00, 0x20
+JMP, JEQ, JGE, K = 0x05, 0x10, 0x30, 0x00
+RET = 0x06
+ARCH_X86_64 = 0xC000003E
+X32 = 0x40000000
+ALLOW = 0x7FFF0000
+ERRNO_EPERM = 0x00050000 | 1          # SECCOMP_RET_ERRNO | EPERM
+OFF_NR, OFF_ARCH = 0, 4               # offsets into struct seccomp_data
+# x86_64 syscall numbers (ABI-stable). unshare/setns/mount/umount2/pivot_root/
+# chroot/open_by_handle_at, init/finit/delete_module, kexec_load/kexec_file_load,
+# iopl/ioperm, add_key/keyctl/request_key, syslog/uselib/acct/modify_ldt/quotactl,
+# move_pages/mbind/get_mempolicy/set_mempolicy/migrate_pages, swapon/swapoff.
+BLOCKED = [272,308,165,166,155,161,304,175,313,176,246,320,172,173,248,250,
+           249,103,134,163,154,179,279,237,239,238,256,167,168]
+k = len(BLOCKED)
+p = [stmt(LD|W|ABS, OFF_ARCH),
+     jmp(JMP|JEQ|K, ARCH_X86_64, 0, k+2),   # not x86_64 -> ALLOW
+     stmt(LD|W|ABS, OFF_NR),
+     jmp(JMP|JGE|K, X32, k, 0)]             # x32 syscall range -> ALLOW
+for i, nr in enumerate(BLOCKED):
+    p.append(jmp(JMP|JEQ|K, nr, k - i, 0))  # match -> ERRNO (EPERM)
+p += [stmt(RET|K, ALLOW), stmt(RET|K, ERRNO_EPERM)]
+sys.stdout.buffer.write(b"".join(p))
+SECEOF
+}
+
 run_bwrap() {
     local -a a=(
         --die-with-parent
@@ -943,15 +989,19 @@ run_bwrap() {
         fi
     done
 
-    # GPU access (DRI)
-    [ -d /dev/dri ] && a+=( --dev-bind-try /dev/dri /dev/dri )
-    [ -d /sys/dev/char ] && a+=( --ro-bind-try /sys/dev/char /sys/dev/char )
-    [ -d /sys/devices ] && a+=( --ro-bind-try /sys/devices /sys/devices )
-
-    # GPU access (NVIDIA): bind all existing /dev/nvidia* nodes
-    for nv_dev in /dev/nvidia*; do
-        [ -e "$nv_dev" ] && a+=( --dev-bind-try "$nv_dev" "$nv_dev" )
-    done
+    # No GPU by default. This old Chromium renders with SwiftShader (software
+    # GL) here anyway, so binding /dev/dri and /dev/nvidia* would only expose the
+    # GPU kernel drivers -- a large attack surface, plus /sys/devices hardware
+    # info -- to a compromised renderer for no functional gain. EKOLOKO_GPU=1
+    # binds them back for a build that needs hardware acceleration.
+    if [ "${EKOLOKO_GPU:-0}" = "1" ]; then
+        [ -d /dev/dri ] && a+=( --dev-bind-try /dev/dri /dev/dri )
+        [ -d /sys/dev/char ] && a+=( --ro-bind-try /sys/dev/char /sys/dev/char )
+        [ -d /sys/devices ] && a+=( --ro-bind-try /sys/devices /sys/devices )
+        for nv_dev in /dev/nvidia*; do
+            [ -e "$nv_dev" ] && a+=( --dev-bind-try "$nv_dev" "$nv_dev" )
+        done
+    fi
 
     # Runtime directory: use resolved path or fallback to temp. No cleanup
     # trap: exec replaces this shell, so a trap would never fire anyway;
@@ -962,8 +1012,16 @@ run_bwrap() {
     fi
     a+=( --dir "$rt_to_use" --chmod 0700 "$rt_to_use" )
 
-    # Wayland socket: only bind if variable is set AND socket exists
-    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$RT/$WAYLAND_DISPLAY" ]; then
+    # Wayland socket. This old Chromium renders through Xwayland, so withhold
+    # the Wayland socket by default: on wlroots compositors (Hyprland, sway) a
+    # bound socket lets any client screenshot, inject input and read the
+    # clipboard with no prompt -- exactly the escape the X11 untrusted cookie
+    # below is there to block, so binding Wayland would reopen it. Keep it only
+    # when there's no X11 to fall back to, or when EKOLOKO_WAYLAND=1 forces it.
+    local use_wayland=0
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$RT/$WAYLAND_DISPLAY" ] \
+       && { [ "${EKOLOKO_WAYLAND:-0}" = "1" ] || [ -z "${DISPLAY:-}" ]; }; then
+        use_wayland=1
         a+=( --ro-bind-try "$RT/$WAYLAND_DISPLAY" "$RT/$WAYLAND_DISPLAY" )
     fi
 
@@ -1023,7 +1081,7 @@ run_bwrap() {
     fi
 
     # Session environment (only if set to avoid blank expansions)
-    [ -n "${WAYLAND_DISPLAY:-}" ] && a+=( --setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY" )
+    [ "$use_wayland" = "1" ] && a+=( --setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY" )
     [ -n "${DISPLAY:-}" ] && a+=( --setenv DISPLAY "$DISPLAY" )
     [ -n "${XDG_SESSION_TYPE:-}" ] && a+=( --setenv XDG_SESSION_TYPE "$XDG_SESSION_TYPE" )
 
@@ -1032,30 +1090,25 @@ run_bwrap() {
         echo "Warning: X11 session with a trusted cookie; the app can observe and inject input into other windows." >&2
     fi
 
+    # Reduce kernel attack surface for the --no-sandbox Chromium with a seccomp
+    # denylist, but only if this kernel/bwrap actually accepts it -- otherwise
+    # launch as before rather than fail. fd 7 because bash marks redirections to
+    # fd >= 10 close-on-exec (bwrap can't inherit them); 8/9 are taken below.
+    if command -v python3 >/dev/null 2>&1 \
+       && bwrap --ro-bind / / --seccomp 7 -- /bin/true >/dev/null 2>&1 7< <(seccomp_filter); then
+        a+=( --seccomp 7 )
+    fi
+
     spawn_layout_mirror
 
     # fd 8/9 feed --ro-bind-data: a two-user passwd/group so the app can
-    # resolve its own uid without seeing the host's account list.
+    # resolve its own uid without seeing the host's account list. fd 7 carries
+    # the seccomp program when the probe above accepted it (ignored otherwise).
     exec bwrap "${a[@]}" "$HOME/app/$BIN_NAME" --no-sandbox "$@" \
+        7< <(seccomp_filter) \
         8< <(printf 'root:x:0:0::/root:/usr/bin/false\n%s:x:%s:%s::%s:/usr/bin/false\n' \
                 "${USER:-user}" "$(id -u)" "$(id -g)" "$HOME") \
         9< <(printf 'root:x:0:\n%s:x:%s:\n' "${USER:-user}" "$(id -g)")
-}
-
-run_firejail() {
-    # --private mounts $HOME_JAIL over $HOME, and the command runs inside
-    # that mount namespace, so the binary must be addressed as $HOME/app/...
-    # ($HOME_JAIL/app/... no longer exists from the sandbox's view).
-    # --read-only keeps the app's own code immutable from inside the jail,
-    # matching the bwrap setup: a compromised game can't trojan the binary
-    # that future launches execute.
-    spawn_layout_mirror
-    exec firejail --quiet --noprofile \
-        --private="$HOME_JAIL" --private-tmp \
-        --read-only="$HOME/app" \
-        --caps.drop=all --nonewprivs --noroot --seccomp \
-        --protocol=unix,inet,inet6,netlink --disable-mnt \
-        "$HOME/app/$BIN_NAME" --no-sandbox "$@"
 }
 
 # Probe whether bubblewrap can actually create a user namespace. On systems
@@ -1088,9 +1141,6 @@ fix below (each persists across reboots), then re-run: ekoloko
 
   Or make bubblewrap setuid-root (works everywhere, one-time root):
     sudo chmod u+s "$(command -v bwrap)"
-
-  Or install firejail (used automatically if present):
-    sudo apt install firejail   # or dnf/pacman/zypper
 
 To skip the sandbox permanently (LESS SECURE: the app runs unconfined
 with your account's full access):
@@ -1156,21 +1206,18 @@ if [ "${EKOLOKO_NO_JAIL:-0}" = "1" ]; then
     exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
 elif command -v bwrap >/dev/null 2>&1 && bwrap_works; then
     run_bwrap "$@"
-elif command -v firejail >/dev/null 2>&1; then
-    # bwrap missing or userns blocked; firejail is setuid so it still works.
-    run_firejail "$@"
 elif command -v bwrap >/dev/null 2>&1; then
-    # bwrap present but user namespaces are blocked, and no firejail
-    # fallback. Explain the real fix, then let the user decide whether to
-    # play unconfined this once.
+    # bwrap present but user namespaces are blocked. Explain the real fix
+    # (sysctl, or setuid bwrap), then let the user decide whether to play
+    # unconfined this once.
     have_tty && userns_help
-    if confirm_unconfined "The sandbox can't start: your system blocks unprivileged user namespaces. See the README's troubleshooting for the permanent fix, or install firejail."; then
+    if confirm_unconfined "The sandbox can't start: your system blocks unprivileged user namespaces. See the README's troubleshooting for the permanent fix."; then
         spawn_layout_mirror
         exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
     fi
     exit 1
 else
-    if confirm_unconfined "No sandbox is installed (bubblewrap or firejail). Install one so the game runs confined."; then
+    if confirm_unconfined "bubblewrap isn't installed. Install it so the game runs confined."; then
         spawn_layout_mirror
         exec "$HOME_JAIL/app/$BIN_NAME" --no-sandbox "$@"
     fi
